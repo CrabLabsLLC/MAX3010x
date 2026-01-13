@@ -629,12 +629,16 @@ static int max3010x_zephyr_init(const struct device *dev)
 	return ret;
 }
 
-#define MAX3010X_DEFINE_NODE(node_id, variant_const)                               \
+#define MAX3010X_VARIANT_FROM_DT(node_id)                                    \
+	(DT_ENUM_IDX(node_id, variant) == 1 ?                               \
+		 MAX3010X_VARIANT_MAX30102 : MAX3010X_VARIANT_MAX30101)
+
+#define MAX3010X_DEFINE_NODE(node_id)                                              \
 	static max3010x_runtime_t max3010x_rt_##node_id;                           \
 	static const max3010x_config_t max3010x_cfg_##node_id = {                  \
 		.i2c = I2C_DT_SPEC_GET(node_id),                                   \
 		.int_gpio = GPIO_DT_SPEC_GET_OR(node_id, int_gpios, {0}),          \
-		.variant = variant_const,                                          \
+		.variant = MAX3010X_VARIANT_FROM_DT(node_id),                       \
 		.mode = MAX3010X_DEFAULT_MODE,                                     \
 		.fifo = {                                                          \
 			.sample_avg = CONFIG_MAX3010X_SAMPLE_AVG,                  \
@@ -672,5 +676,4 @@ static int max3010x_zephyr_init(const struct device *dev)
 			 &max3010x_rt_##node_id, &max3010x_cfg_##node_id,        \
 			 POST_KERNEL, MAX3010X_INIT_PRIORITY, &max3010x_api);
 
-DT_FOREACH_STATUS_OKAY_VARGS(maxim_max30101, MAX3010X_DEFINE_NODE, MAX3010X_VARIANT_MAX30101)
-DT_FOREACH_STATUS_OKAY_VARGS(maxim_max30102, MAX3010X_DEFINE_NODE, MAX3010X_VARIANT_MAX30102)
+DT_FOREACH_STATUS_OKAY(maxim_max3010x, MAX3010X_DEFINE_NODE)

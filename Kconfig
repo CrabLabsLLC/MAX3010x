@@ -4,7 +4,7 @@
 menuconfig MAX3010X
 	bool "MAX3010x pulse oximeter and heart rate sensor"
 	default y
-	depends on (DT_HAS_MAXIM_MAX30101_ENABLED || DT_HAS_MAXIM_MAX30102_ENABLED)
+	depends on DT_HAS_MAXIM_MAX3010X_ENABLED
 	select I2C
 	select GPIO
 	select SENSOR
