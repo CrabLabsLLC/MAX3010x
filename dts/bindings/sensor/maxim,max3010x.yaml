@@ -1,0 +1,28 @@
+# Copyright (c) 2025 Makani Science
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Maxim MAX3010x pulse oximeter and heart rate sensor.
+  Supports MAX30101 (Red + IR + Green) and MAX30102 (Red + IR).
+
+compatible: "maxim,max3010x"
+
+include: [sensor-device.yaml, i2c-device.yaml]
+
+properties:
+  variant:
+    type: string
+    required: true
+    enum:
+      - "max30101"
+      - "max30102"
+    description: |
+      Selects the silicon variant used on the board.
+      MAX30101 has 3 LEDs (Red, IR, Green).
+      MAX30102 has 2 LEDs (Red, IR).
+
+  int-gpios:
+    type: phandle-array
+    description: |
+      Optional interrupt GPIO. The sensor signals data ready and
+      FIFO almost full via this open-drain, active-low output.
