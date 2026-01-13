@@ -1,0 +1,137 @@
+# Copyright (c) 2025 Makani Science
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig MAX3010X
+	bool "MAX3010x pulse oximeter and heart rate sensor"
+	default y
+	depends on (DT_HAS_MAXIM_MAX30101_ENABLED || DT_HAS_MAXIM_MAX30102_ENABLED)
+	select I2C
+	select GPIO
+	select SENSOR
+	help
+	  Enable the MAX3010x driver (MAX30101/MAX30102).
+	  Defaults set here are applied at init, and can be overridden at runtime.
+
+if MAX3010X
+
+choice MAX3010X_MODE
+	prompt "Operating mode"
+	default MAX3010X_MODE_MULTI_LED
+
+config MAX3010X_MODE_HEART_RATE
+	bool "Heart rate mode"
+
+config MAX3010X_MODE_SPO2
+	bool "SpO2 mode"
+
+config MAX3010X_MODE_MULTI_LED
+	bool "Multi-LED mode"
+
+endchoice
+
+config MAX3010X_SAMPLE_AVG
+	int "Sample averaging"
+	range 0 7
+	default 0
+	help
+	  0 = 1 sample, 1 = 2 samples, 2 = 4 samples, 3 = 8 samples,
+	  4 = 16 samples, 5-7 = 32 samples.
+
+config MAX3010X_FIFO_ROLLOVER_EN
+	bool "FIFO rollover enable"
+	default y
+
+config MAX3010X_FIFO_A_FULL
+	int "FIFO almost full threshold"
+	range 0 15
+	default 8
+
+config MAX3010X_ADC_RANGE
+	int "ADC range"
+	range 0 3
+	default 2
+	help
+	  0=7.81 pA/LSB, 1=15.63 pA/LSB, 2=31.25 pA/LSB, 3=62.5 pA/LSB
+
+config MAX3010X_SAMPLE_RATE
+	int "Sample rate"
+	range 0 7
+	default 0
+	help
+	  0=50Hz, 1=100Hz, 2=200Hz, 3=400Hz, 4=800Hz, 5=1000Hz, 6=1600Hz, 7=3200Hz
+
+config MAX3010X_PULSE_WIDTH
+	int "Pulse width"
+	range 0 3
+	default 3
+	help
+	  0=69us (15-bit), 1=118us (16-bit), 2=215us (17-bit), 3=411us (18-bit)
+
+config MAX3010X_LED1_PA
+	hex "LED1 (red) pulse amplitude"
+	range 0 0xff
+	default 0x33
+
+config MAX3010X_LED2_PA
+	hex "LED2 (IR) pulse amplitude"
+	range 0 0xff
+	default 0x33
+
+config MAX3010X_LED3_PA
+	hex "LED3 (green) pulse amplitude"
+	range 0 0xff
+	default 0x00
+
+config MAX3010X_LED4_PA
+	hex "LED4 (green) pulse amplitude"
+	range 0 0xff
+	default 0x00
+
+config MAX3010X_PILOT_PA
+	hex "Pilot LED pulse amplitude"
+	range 0 0xff
+	default 0x00
+
+config MAX3010X_SLOT1
+	int "Slot 1 selection"
+	range 0 7
+	default 1
+	help
+	  0=disabled, 1=RED, 2=IR, 3=GREEN, 4=disabled, 5=RED pilot,
+	  6=IR pilot, 7=GREEN pilot.
+
+config MAX3010X_SLOT2
+	int "Slot 2 selection"
+	range 0 7
+	default 2
+
+config MAX3010X_SLOT3
+	int "Slot 3 selection"
+	range 0 7
+	default 0
+
+config MAX3010X_SLOT4
+	int "Slot 4 selection"
+	range 0 7
+	default 0
+
+config MAX3010X_INT_ENABLE_1
+	hex "Interrupt enable 1 mask"
+	range 0 0xff
+	default 0x00
+
+config MAX3010X_INT_ENABLE_2
+	hex "Interrupt enable 2 mask"
+	range 0 0xff
+	default 0x00
+
+config MAX3010X_PROX_INT_THRESH
+	hex "Proximity interrupt threshold"
+	range 0 0xff
+	default 0x00
+
+config MAX3010X_TEMP_ENABLE
+	bool "Enable die temperature conversions"
+	default n
+
+endif # MAX3010X

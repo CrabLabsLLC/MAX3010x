@@ -1,0 +1,676 @@
+/*
+ * Copyright (c) 2025 Makani Science
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <zephyr/kernel.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/sys/util.h>
+#include <zephyr/drivers/sensor.h>
+#include <zephyr/logging/log.h>
+
+#include "max3010x.h"
+
+LOG_MODULE_REGISTER(max3010x, CONFIG_LOG_DEFAULT_LEVEL);
+
+typedef struct
+{
+	max3010x_data_t data;
+	max3010x_channel_map_t map;
+} max3010x_runtime_t;
+
+static int max3010x_reg_read(const max3010x_config_t *cfg, uint8_t reg, uint8_t *val)
+{
+	return i2c_reg_read_byte_dt(&cfg->i2c, reg, val);
+}
+
+static int max3010x_reg_write(const max3010x_config_t *cfg, uint8_t reg, uint8_t val)
+{
+	return i2c_reg_write_byte_dt(&cfg->i2c, reg, val);
+}
+
+static int max3010x_burst_read(const max3010x_config_t *cfg, uint8_t reg,
+			       uint8_t *buf, size_t len)
+{
+	return i2c_burst_read_dt(&cfg->i2c, reg, buf, len);
+}
+
+static int max3010x_sample_fetch(const struct device *dev, enum sensor_channel chan)
+{
+	ARG_UNUSED(chan);
+
+	max3010x_runtime_t *rt = dev->data;
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t buffer[MAX3010X_MAX_NUM_CHANNELS * MAX3010X_BYTES_PER_CHANNEL];
+	const int num_bytes = rt->map.active_channels * MAX3010X_BYTES_PER_CHANNEL;
+
+	if (num_bytes == 0)
+	{
+		return -ENODATA;
+	}
+
+	if (max3010x_burst_read(cfg, MAX3010X_REG_FIFO_DATA, buffer, num_bytes))
+	{
+		LOG_ERR("FIFO read failed");
+		return -EIO;
+	}
+
+	for (int i = 0; i < rt->map.active_channels; i++)
+	{
+		const int base = i * MAX3010X_BYTES_PER_CHANNEL;
+		uint32_t sample = ((uint32_t)buffer[base] << 16) |
+				  ((uint32_t)buffer[base + 1] << 8) |
+				  (uint32_t)buffer[base + 2];
+		rt->data.raw[i] = sample & MAX3010X_FIFO_DATA_MASK;
+	}
+
+	return 0;
+}
+
+static int max3010x_channel_get(const struct device *dev, enum sensor_channel chan,
+			struct sensor_value *val)
+{
+	max3010x_runtime_t *rt = dev->data;
+	uint8_t led_chan;
+	uint8_t fifo_chan;
+
+	switch (chan)
+	{
+	case SENSOR_CHAN_RED:
+		led_chan = MAX3010X_LED_RED;
+		break;
+	case SENSOR_CHAN_IR:
+		led_chan = MAX3010X_LED_IR;
+		break;
+	case SENSOR_CHAN_GREEN:
+		led_chan = MAX3010X_LED_GREEN;
+		break;
+	default:
+		return -ENOTSUP;
+	}
+
+	fifo_chan = rt->map.fifo_index[led_chan];
+	if (fifo_chan >= MAX3010X_MAX_NUM_CHANNELS)
+	{
+		return -ENOTSUP;
+	}
+
+	val->val1 = rt->data.raw[fifo_chan];
+	val->val2 = 0;
+	return 0;
+}
+
+static DEVICE_API(sensor, max3010x_api) = {
+	.sample_fetch = max3010x_sample_fetch,
+	.channel_get = max3010x_channel_get,
+};
+
+// Default operating mode from Kconfig
+#if defined(CONFIG_MAX3010X_MODE_HEART_RATE)
+#define MAX3010X_DEFAULT_MODE MAX3010X_MODE_HEART_RATE
+#elif defined(CONFIG_MAX3010X_MODE_SPO2)
+#define MAX3010X_DEFAULT_MODE MAX3010X_MODE_SPO2
+#else
+#define MAX3010X_DEFAULT_MODE MAX3010X_MODE_MULTI_LED
+#endif
+
+#if defined(CONFIG_SENSOR_INIT_PRIORITY)
+#define MAX3010X_INIT_PRIORITY CONFIG_SENSOR_INIT_PRIORITY
+#else
+#define MAX3010X_INIT_PRIORITY 90
+#endif
+
+static void max3010x_build_channel_map(const max3010x_config_t *cfg,
+				       max3010x_channel_map_t *map)
+{
+	map->active_channels = 0;
+	for (int i = 0; i < MAX3010X_MAX_NUM_CHANNELS; i++)
+	{
+		map->fifo_index[i] = MAX3010X_MAX_NUM_CHANNELS;
+	}
+
+	for (int fifo = 0; fifo < MAX3010X_MAX_NUM_CHANNELS; fifo++)
+	{
+		const uint8_t slot = (uint8_t)cfg->slots.slot[fifo] & 0x03;
+		if (slot == 0)
+		{
+			continue;
+		}
+
+		const uint8_t led_chan = slot - 1;
+		if (cfg->variant == MAX3010X_VARIANT_MAX30102 && led_chan == MAX3010X_LED_GREEN)
+		{
+			continue;
+		}
+
+		if (led_chan < MAX3010X_MAX_NUM_CHANNELS)
+		{
+			map->fifo_index[led_chan] = fifo;
+			map->active_channels++;
+		}
+	}
+}
+
+static max3010x_slot_t max3010x_sanitize_slot(const max3010x_config_t *cfg,
+					      max3010x_slot_t slot)
+{
+	if (cfg->variant != MAX3010X_VARIANT_MAX30102)
+	{
+		return slot;
+	}
+
+	if (slot == MAX3010X_SLOT_GREEN_LED3_PA ||
+	    slot == MAX3010X_SLOT_GREEN_PILOT_PA)
+	{
+		return MAX3010X_SLOT_DISABLED;
+	}
+
+	return slot;
+}
+
+int max3010x_reset(const struct device *dev)
+{
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t mode_cfg = 0;
+
+	if (max3010x_reg_write(cfg, MAX3010X_REG_MODE_CONFIG, MAX3010X_MODE_RESET))
+	{
+		return -EIO;
+	}
+
+	do
+	{
+		if (max3010x_reg_read(cfg, MAX3010X_REG_MODE_CONFIG, &mode_cfg))
+		{
+			return -EIO;
+		}
+	} while (mode_cfg & MAX3010X_MODE_RESET);
+
+	return 0;
+}
+
+int max3010x_set_mode(const struct device *dev, max3010x_mode_t mode)
+{
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t mode_cfg = 0;
+
+	if (max3010x_reg_read(cfg, MAX3010X_REG_MODE_CONFIG, &mode_cfg))
+	{
+		return -EIO;
+	}
+
+	mode_cfg &= (uint8_t)~MAX3010X_MODE_MASK;
+	mode_cfg |= (uint8_t)(mode & MAX3010X_MODE_MASK);
+
+	return max3010x_reg_write(cfg, MAX3010X_REG_MODE_CONFIG, mode_cfg);
+}
+
+int max3010x_enable(const struct device *dev)
+{
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t mode_cfg = 0;
+
+	if (max3010x_reg_read(cfg, MAX3010X_REG_MODE_CONFIG, &mode_cfg))
+	{
+		return -EIO;
+	}
+
+	mode_cfg &= (uint8_t)~MAX3010X_MODE_SHDN;
+	return max3010x_reg_write(cfg, MAX3010X_REG_MODE_CONFIG, mode_cfg);
+}
+
+int max3010x_disable(const struct device *dev)
+{
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t mode_cfg = 0;
+
+	if (max3010x_reg_read(cfg, MAX3010X_REG_MODE_CONFIG, &mode_cfg))
+	{
+		return -EIO;
+	}
+
+	mode_cfg |= MAX3010X_MODE_SHDN;
+	return max3010x_reg_write(cfg, MAX3010X_REG_MODE_CONFIG, mode_cfg);
+}
+
+int max3010x_set_fifo_config(const struct device *dev,
+			     const max3010x_fifo_config_t *cfg_in)
+{
+	if (!cfg_in)
+	{
+		return -EINVAL;
+	}
+
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t fifo_cfg = (uint8_t)(cfg_in->sample_avg << MAX3010X_FIFO_SMP_AVE_SHIFT) |
+			   (uint8_t)(cfg_in->almost_full & MAX3010X_FIFO_A_FULL_MASK);
+	if (cfg_in->rollover)
+	{
+		fifo_cfg |= MAX3010X_FIFO_ROLLOVER_EN;
+	}
+
+	return max3010x_reg_write(cfg, MAX3010X_REG_FIFO_CONFIG, fifo_cfg);
+}
+
+int max3010x_set_spo2_config(const struct device *dev,
+			     const max3010x_spo2_config_t *cfg_in)
+{
+	if (!cfg_in)
+	{
+		return -EINVAL;
+	}
+
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t spo2_cfg = (uint8_t)(cfg_in->adc_range << MAX3010X_SPO2_ADC_RGE_SHIFT) |
+			   (uint8_t)(cfg_in->sample_rate << MAX3010X_SPO2_SR_SHIFT) |
+			   (uint8_t)(cfg_in->pulse_width << MAX3010X_SPO2_PW_SHIFT);
+
+	return max3010x_reg_write(cfg, MAX3010X_REG_SPO2_CONFIG, spo2_cfg);
+}
+
+int max3010x_set_adc_range(const struct device *dev, max3010x_adc_range_t range)
+{
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t spo2_cfg = 0;
+
+	if (max3010x_reg_read(cfg, MAX3010X_REG_SPO2_CONFIG, &spo2_cfg))
+	{
+		return -EIO;
+	}
+
+	spo2_cfg &= (uint8_t)~MAX3010X_SPO2_ADC_RGE_MASK;
+	spo2_cfg |= (uint8_t)(range << MAX3010X_SPO2_ADC_RGE_SHIFT);
+	return max3010x_reg_write(cfg, MAX3010X_REG_SPO2_CONFIG, spo2_cfg);
+}
+
+int max3010x_set_sample_rate(const struct device *dev, max3010x_sample_rate_t rate)
+{
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t spo2_cfg = 0;
+
+	if (max3010x_reg_read(cfg, MAX3010X_REG_SPO2_CONFIG, &spo2_cfg))
+	{
+		return -EIO;
+	}
+
+	spo2_cfg &= (uint8_t)~MAX3010X_SPO2_SR_MASK;
+	spo2_cfg |= (uint8_t)(rate << MAX3010X_SPO2_SR_SHIFT);
+	return max3010x_reg_write(cfg, MAX3010X_REG_SPO2_CONFIG, spo2_cfg);
+}
+
+int max3010x_set_pulse_width(const struct device *dev, max3010x_pulse_width_t width)
+{
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t spo2_cfg = 0;
+
+	if (max3010x_reg_read(cfg, MAX3010X_REG_SPO2_CONFIG, &spo2_cfg))
+	{
+		return -EIO;
+	}
+
+	spo2_cfg &= (uint8_t)~MAX3010X_SPO2_PW_MASK;
+	spo2_cfg |= (uint8_t)(width << MAX3010X_SPO2_PW_SHIFT);
+	return max3010x_reg_write(cfg, MAX3010X_REG_SPO2_CONFIG, spo2_cfg);
+}
+
+int max3010x_set_led_pa(const struct device *dev, const max3010x_led_pa_t *cfg_in)
+{
+	if (!cfg_in)
+	{
+		return -EINVAL;
+	}
+
+	const max3010x_config_t *cfg = dev->config;
+	max3010x_led_pa_t led_pa = *cfg_in;
+	if (cfg->variant == MAX3010X_VARIANT_MAX30102)
+	{
+		led_pa.green = 0;
+		led_pa.green2 = 0;
+	}
+
+	if (max3010x_reg_write(cfg, MAX3010X_REG_LED1_PA, led_pa.red))
+	{
+		return -EIO;
+	}
+	if (max3010x_reg_write(cfg, MAX3010X_REG_LED2_PA, led_pa.ir))
+	{
+		return -EIO;
+	}
+	if (max3010x_reg_write(cfg, MAX3010X_REG_LED3_PA, led_pa.green))
+	{
+		return -EIO;
+	}
+	if (max3010x_reg_write(cfg, MAX3010X_REG_LED4_PA, led_pa.green2))
+	{
+		return -EIO;
+	}
+	if (max3010x_reg_write(cfg, MAX3010X_REG_PILOT_PA, led_pa.pilot))
+	{
+		return -EIO;
+	}
+
+	return 0;
+}
+
+int max3010x_set_led_channel_pa(const struct device *dev,
+				max3010x_led_channel_t channel,
+				uint8_t value)
+{
+	const max3010x_config_t *cfg = dev->config;
+
+	switch (channel)
+	{
+	case MAX3010X_LED_RED:
+		return max3010x_reg_write(cfg, MAX3010X_REG_LED1_PA, value);
+	case MAX3010X_LED_IR:
+		return max3010x_reg_write(cfg, MAX3010X_REG_LED2_PA, value);
+	case MAX3010X_LED_GREEN:
+		if (cfg->variant == MAX3010X_VARIANT_MAX30102)
+		{
+			return -ENOTSUP;
+		}
+		return max3010x_reg_write(cfg, MAX3010X_REG_LED3_PA, value);
+	default:
+		return -EINVAL;
+	}
+}
+
+int max3010x_set_slots(const struct device *dev, const max3010x_slot_config_t *cfg_in)
+{
+	if (!cfg_in)
+	{
+		return -EINVAL;
+	}
+
+	const max3010x_config_t *cfg = dev->config;
+	max3010x_slot_t s0 = max3010x_sanitize_slot(cfg, cfg_in->slot[0]);
+	max3010x_slot_t s1 = max3010x_sanitize_slot(cfg, cfg_in->slot[1]);
+	max3010x_slot_t s2 = max3010x_sanitize_slot(cfg, cfg_in->slot[2]);
+	max3010x_slot_t s3 = max3010x_sanitize_slot(cfg, cfg_in->slot[3]);
+	uint8_t slot1_2 = (uint8_t)(s1 << 4) | (uint8_t)s0;
+	uint8_t slot3_4 = (uint8_t)(s3 << 4) | (uint8_t)s2;
+
+	if (max3010x_reg_write(cfg, MAX3010X_REG_MULTI_LED_CTRL1, slot1_2))
+	{
+		return -EIO;
+	}
+	if (max3010x_reg_write(cfg, MAX3010X_REG_MULTI_LED_CTRL2, slot3_4))
+	{
+		return -EIO;
+	}
+
+	max3010x_runtime_t *rt = dev->data;
+	max3010x_build_channel_map(cfg, &rt->map);
+	return 0;
+}
+
+int max3010x_set_interrupts(const struct device *dev, uint8_t int1_mask, uint8_t int2_mask)
+{
+	const max3010x_config_t *cfg = dev->config;
+	if (max3010x_reg_write(cfg, MAX3010X_REG_INT_ENABLE_1, int1_mask))
+	{
+		return -EIO;
+	}
+	if (max3010x_reg_write(cfg, MAX3010X_REG_INT_ENABLE_2, int2_mask))
+	{
+		return -EIO;
+	}
+	return 0;
+}
+
+int max3010x_set_prox_int_thresh(const struct device *dev, uint8_t threshold)
+{
+	const max3010x_config_t *cfg = dev->config;
+	return max3010x_reg_write(cfg, MAX3010X_REG_PROX_INT_THRESH, threshold);
+}
+
+int max3010x_set_temp_enable(const struct device *dev, bool enable)
+{
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t temp_cfg = enable ? MAX3010X_TEMP_EN : 0;
+	return max3010x_reg_write(cfg, MAX3010X_REG_TEMP_CONFIG, temp_cfg);
+}
+
+int max3010x_get_interrupt_status(const struct device *dev, uint8_t *int1, uint8_t *int2)
+{
+	const max3010x_config_t *cfg = dev->config;
+	if (int1 && max3010x_reg_read(cfg, MAX3010X_REG_INT_STATUS_1, int1))
+	{
+		return -EIO;
+	}
+	if (int2 && max3010x_reg_read(cfg, MAX3010X_REG_INT_STATUS_2, int2))
+	{
+		return -EIO;
+	}
+	return 0;
+}
+
+int max3010x_read_fifo(const struct device *dev, uint8_t *buf, size_t bytes)
+{
+	if (!buf || bytes == 0)
+	{
+		return -EINVAL;
+	}
+
+	const max3010x_config_t *cfg = dev->config;
+	return max3010x_burst_read(cfg, MAX3010X_REG_FIFO_DATA, buf, bytes);
+}
+
+int max3010x_get_raw_channel(const struct device *dev,
+			     max3010x_led_channel_t channel,
+			     uint32_t *value)
+{
+	if (!value)
+	{
+		return -EINVAL;
+	}
+
+	max3010x_runtime_t *rt = dev->data;
+	uint8_t fifo_chan = rt->map.fifo_index[channel];
+	if (fifo_chan >= MAX3010X_MAX_NUM_CHANNELS)
+	{
+		return -ENOTSUP;
+	}
+
+	*value = rt->data.raw[fifo_chan];
+	return 0;
+}
+
+uint8_t max3010x_get_num_channels(const struct device *dev)
+{
+	const max3010x_runtime_t *rt = dev->data;
+	return rt->map.active_channels;
+}
+
+int max3010x_init(const struct device *dev)
+{
+	max3010x_runtime_t *rt = dev->data;
+	const max3010x_config_t *cfg = dev->config;
+	uint8_t part_id = 0;
+
+	if (!device_is_ready(cfg->i2c.bus))
+	{
+		return -ENODEV;
+	}
+
+	if (cfg->int_gpio.port)
+	{
+		if (!gpio_is_ready_dt(&cfg->int_gpio))
+		{
+			return -ENODEV;
+		}
+
+		int ret = gpio_pin_configure_dt(&cfg->int_gpio, GPIO_INPUT);
+		if (ret < 0)
+		{
+			return ret;
+		}
+	}
+
+	if (max3010x_reg_read(cfg, MAX3010X_REG_PART_ID, &part_id))
+	{
+		return -EIO;
+	}
+
+	if (cfg->variant == MAX3010X_VARIANT_MAX30101 && part_id != MAX30101_PART_ID)
+	{
+		LOG_ERR("Unexpected part ID: 0x%02X", part_id);
+		return -ENODEV;
+	}
+	if (cfg->variant == MAX3010X_VARIANT_MAX30102 && part_id != MAX30102_PART_ID)
+	{
+		LOG_ERR("Unexpected part ID: 0x%02X", part_id);
+		return -ENODEV;
+	}
+
+	if (max3010x_reset(dev))
+	{
+		return -EIO;
+	}
+
+	if (max3010x_set_mode(dev, cfg->mode))
+	{
+		return -EIO;
+	}
+
+	if (max3010x_set_fifo_config(dev, &cfg->fifo))
+	{
+		return -EIO;
+	}
+
+	if (max3010x_set_spo2_config(dev, &cfg->spo2))
+	{
+		return -EIO;
+	}
+
+	if (max3010x_set_led_pa(dev, &cfg->led_pa))
+	{
+		return -EIO;
+	}
+
+	if (max3010x_set_slots(dev, &cfg->slots))
+	{
+		return -EIO;
+	}
+
+	if (max3010x_set_interrupts(dev, cfg->interrupts.int1_mask, cfg->interrupts.int2_mask))
+	{
+		return -EIO;
+	}
+
+	if (max3010x_set_prox_int_thresh(dev, cfg->prox_int_thresh))
+	{
+		return -EIO;
+	}
+
+	if (max3010x_set_temp_enable(dev, cfg->temp_enable))
+	{
+		return -EIO;
+	}
+
+	for (int i = 0; i < MAX3010X_MAX_NUM_CHANNELS; i++)
+	{
+		rt->data.raw[i] = 0;
+		rt->map.fifo_index[i] = MAX3010X_MAX_NUM_CHANNELS;
+	}
+	max3010x_build_channel_map(cfg, &rt->map);
+
+	return 0;
+}
+
+int max3010x_apply_default_config(const struct device *dev)
+{
+	const max3010x_config_t *cfg = dev->config;
+
+	if (max3010x_set_mode(dev, cfg->mode))
+	{
+		return -EIO;
+	}
+	if (max3010x_set_fifo_config(dev, &cfg->fifo))
+	{
+		return -EIO;
+	}
+	if (max3010x_set_spo2_config(dev, &cfg->spo2))
+	{
+		return -EIO;
+	}
+	if (max3010x_set_led_pa(dev, &cfg->led_pa))
+	{
+		return -EIO;
+	}
+	if (max3010x_set_slots(dev, &cfg->slots))
+	{
+		return -EIO;
+	}
+
+	if (max3010x_set_interrupts(dev, cfg->interrupts.int1_mask, cfg->interrupts.int2_mask))
+	{
+		return -EIO;
+	}
+	if (max3010x_set_prox_int_thresh(dev, cfg->prox_int_thresh))
+	{
+		return -EIO;
+	}
+	if (max3010x_set_temp_enable(dev, cfg->temp_enable))
+	{
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int max3010x_zephyr_init(const struct device *dev)
+{
+	int ret = max3010x_init(dev);
+	if (ret < 0)
+	{
+		LOG_ERR("Init failed: %d", ret);
+	}
+	return ret;
+}
+
+#define MAX3010X_DEFINE_NODE(node_id, variant_const)                               \
+	static max3010x_runtime_t max3010x_rt_##node_id;                           \
+	static const max3010x_config_t max3010x_cfg_##node_id = {                  \
+		.i2c = I2C_DT_SPEC_GET(node_id),                                   \
+		.int_gpio = GPIO_DT_SPEC_GET_OR(node_id, int_gpios, {0}),          \
+		.variant = variant_const,                                          \
+		.mode = MAX3010X_DEFAULT_MODE,                                     \
+		.fifo = {                                                          \
+			.sample_avg = CONFIG_MAX3010X_SAMPLE_AVG,                  \
+			.almost_full = CONFIG_MAX3010X_FIFO_A_FULL,                \
+			.rollover = CONFIG_MAX3010X_FIFO_ROLLOVER_EN,              \
+		},                                                                 \
+		.spo2 = {                                                          \
+			.adc_range = CONFIG_MAX3010X_ADC_RANGE,                    \
+			.sample_rate = CONFIG_MAX3010X_SAMPLE_RATE,                \
+			.pulse_width = CONFIG_MAX3010X_PULSE_WIDTH,                \
+		},                                                                 \
+		.slots = {                                                         \
+			.slot = {                                                  \
+				CONFIG_MAX3010X_SLOT1,                             \
+				CONFIG_MAX3010X_SLOT2,                             \
+				CONFIG_MAX3010X_SLOT3,                             \
+				CONFIG_MAX3010X_SLOT4,                             \
+			},                                                         \
+		},                                                                 \
+		.led_pa = {                                                        \
+			.red = CONFIG_MAX3010X_LED1_PA,                           \
+			.ir = CONFIG_MAX3010X_LED2_PA,                            \
+			.green = CONFIG_MAX3010X_LED3_PA,                         \
+			.green2 = CONFIG_MAX3010X_LED4_PA,                        \
+			.pilot = CONFIG_MAX3010X_PILOT_PA,                        \
+		},                                                                 \
+		.interrupts = {                                                    \
+			.int1_mask = CONFIG_MAX3010X_INT_ENABLE_1,                \
+			.int2_mask = CONFIG_MAX3010X_INT_ENABLE_2,                \
+		},                                                                 \
+		.prox_int_thresh = CONFIG_MAX3010X_PROX_INT_THRESH,                \
+		.temp_enable = IS_ENABLED(CONFIG_MAX3010X_TEMP_ENABLE),          \
+	};                                                                     \
+	DEVICE_DT_DEFINE(node_id, max3010x_zephyr_init, NULL,                    \
+			 &max3010x_rt_##node_id, &max3010x_cfg_##node_id,        \
+			 POST_KERNEL, MAX3010X_INIT_PRIORITY, &max3010x_api);
+
+DT_FOREACH_STATUS_OKAY_VARGS(maxim_max30101, MAX3010X_DEFINE_NODE, MAX3010X_VARIANT_MAX30101)
+DT_FOREACH_STATUS_OKAY_VARGS(maxim_max30102, MAX3010X_DEFINE_NODE, MAX3010X_VARIANT_MAX30102)

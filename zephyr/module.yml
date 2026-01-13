@@ -1,0 +1,6 @@
+name: max3010x
+build:
+  cmake: .
+  kconfig: Kconfig
+  settings:
+    dts_root: .
