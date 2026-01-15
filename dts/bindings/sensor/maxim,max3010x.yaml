@@ -3,7 +3,24 @@
 
 description: |
   Maxim MAX3010x pulse oximeter and heart rate sensor.
-  Supports MAX30101 (Red + IR + Green) and MAX30102 (Red + IR).
+
+  Supports MAX30101 (Red + IR + Green LEDs) and MAX30102 (Red + IR LEDs).
+  Used for PPG (photoplethysmography) measurements in SpO2 and heart rate
+  monitoring applications.
+
+  The driver initializes the device in shutdown mode. Call max3010x_enable()
+  to start measurements. Configuration defaults come from Kconfig and can
+  be changed at runtime via the driver API.
+
+  Example devicetree node:
+    &i2c0 {
+      ppg: max30101@57 {
+        compatible = "maxim,max3010x";
+        reg = <0x57>;
+        variant = "max30101";
+        int-gpios = <&gpio0 12 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+      };
+    };
 
 compatible: "maxim,max3010x"
 
@@ -17,12 +34,21 @@ properties:
       - "max30101"
       - "max30102"
     description: |
-      Selects the silicon variant used on the board.
-      MAX30101 has 3 LEDs (Red, IR, Green).
-      MAX30102 has 2 LEDs (Red, IR).
+      Silicon variant on the board.
+        - max30101: 3 LEDs (Red, IR, Green) - full SpO2 + PPG
+        - max30102: 2 LEDs (Red, IR) - SpO2 only
 
   int-gpios:
     type: phandle-array
     description: |
-      Optional interrupt GPIO. The sensor signals data ready and
-      FIFO almost full via this open-drain, active-low output.
+      Optional interrupt GPIO connected to the sensor INT pin.
+      The MAX3010x INT pin is open-drain, active-low.
+
+      When configured, the driver can trigger callbacks on:
+        - FIFO almost full (for batch reads)
+        - New PPG data ready
+        - Ambient light overflow
+        - Proximity detection
+        - Die temperature ready
+
+      If not specified, polling mode must be used.

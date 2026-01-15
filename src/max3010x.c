@@ -1,11 +1,24 @@
 /*
  * Copyright (c) 2025 Makani Science
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * MAX3010x PPG/SpO2 sensor driver (MAX30101/MAX30102)
+ *
+ * Init sequence:
+ *   1. Verify I2C ready
+ *   2. Read and verify part ID
+ *   3. Soft reset and wait
+ *   4. Apply Kconfig/DT defaults (mode, FIFO, SpO2, LED currents, slots)
+ *   5. Put device in SHUTDOWN mode
+ *   6. Configure GPIO interrupt (but leave disabled)
+ *
+ * The device stays in shutdown until max3010x_enable() is called.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/logging/log.h>
 
@@ -13,10 +26,16 @@
 
 LOG_MODULE_REGISTER(max3010x, CONFIG_LOG_DEFAULT_LEVEL);
 
+/* Runtime data - separate from const config */
 typedef struct
 {
 	max3010x_data_t data;
 	max3010x_channel_map_t map;
+	max3010x_int_callback_t int_callback;
+	void *int_user_data;
+	struct gpio_callback gpio_cb;
+	atomic_t sample_count;
+	const struct device *dev;
 } max3010x_runtime_t;
 
 static int max3010x_reg_read(const max3010x_config_t *cfg, uint8_t reg, uint8_t *val)
@@ -100,6 +119,25 @@ static int max3010x_channel_get(const struct device *dev, enum sensor_channel ch
 	return 0;
 }
 
+static void max3010x_gpio_handler(const struct device *port, struct gpio_callback *cb,
+				  uint32_t pins)
+{
+	ARG_UNUSED(port);
+	ARG_UNUSED(pins);
+
+	max3010x_runtime_t *rt = CONTAINER_OF(cb, max3010x_runtime_t, gpio_cb);
+	const struct device *dev = rt->dev;
+
+	/* Always increment sample counter on interrupt */
+	atomic_inc(&rt->sample_count);
+
+	/* Invoke callback if registered (ISR context) */
+	if (rt->int_callback)
+	{
+		rt->int_callback(dev, rt->int_user_data);
+	}
+}
+
 static DEVICE_API(sensor, max3010x_api) = {
 	.sample_fetch = max3010x_sample_fetch,
 	.channel_get = max3010x_channel_get,
@@ -172,6 +210,7 @@ int max3010x_reset(const struct device *dev)
 {
 	const max3010x_config_t *cfg = dev->config;
 	uint8_t mode_cfg = 0;
+	int timeout_ms = 100;
 
 	if (max3010x_reg_write(cfg, MAX3010X_REG_MODE_CONFIG, MAX3010X_MODE_RESET))
 	{
@@ -180,11 +219,18 @@ int max3010x_reset(const struct device *dev)
 
 	do
 	{
+		k_msleep(1);
 		if (max3010x_reg_read(cfg, MAX3010X_REG_MODE_CONFIG, &mode_cfg))
 		{
 			return -EIO;
 		}
-	} while (mode_cfg & MAX3010X_MODE_RESET);
+		timeout_ms--;
+	} while ((mode_cfg & MAX3010X_MODE_RESET) && (timeout_ms > 0));
+
+	if (timeout_ms <= 0)
+	{
+		return -ETIMEDOUT;
+	}
 
 	return 0;
 }
@@ -431,6 +477,44 @@ int max3010x_set_temp_enable(const struct device *dev, bool enable)
 	return max3010x_reg_write(cfg, MAX3010X_REG_TEMP_CONFIG, temp_cfg);
 }
 
+int max3010x_get_temp(const struct device *dev, float *temp_c)
+{
+	if (!temp_c)
+	{
+		return -EINVAL;
+	}
+
+	const max3010x_config_t *cfg = dev->config;
+
+	/* Trigger temperature conversion */
+	int ret = max3010x_reg_write(cfg, MAX3010X_REG_TEMP_CONFIG, MAX3010X_TEMP_EN);
+	if (ret)
+	{
+		return -EIO;
+	}
+
+	/* Wait for conversion (~30ms typical) */
+	k_msleep(40);
+
+	/* Read temperature registers */
+	uint8_t temp_int, temp_frac;
+	ret = max3010x_reg_read(cfg, MAX3010X_REG_TEMP_INT, &temp_int);
+	if (ret)
+	{
+		return -EIO;
+	}
+
+	ret = max3010x_reg_read(cfg, MAX3010X_REG_TEMP_FRAC, &temp_frac);
+	if (ret)
+	{
+		return -EIO;
+	}
+
+	/* Convert: TEMP_INT is signed integer part, TEMP_FRAC is 1/16 degree increments */
+	*temp_c = (float)(int8_t)temp_int + ((float)(temp_frac & 0x0F) * 0.0625f);
+	return 0;
+}
+
 int max3010x_get_interrupt_status(const struct device *dev, uint8_t *int1, uint8_t *int2)
 {
 	const max3010x_config_t *cfg = dev->config;
@@ -454,6 +538,28 @@ int max3010x_read_fifo(const struct device *dev, uint8_t *buf, size_t bytes)
 
 	const max3010x_config_t *cfg = dev->config;
 	return max3010x_burst_read(cfg, MAX3010X_REG_FIFO_DATA, buf, bytes);
+}
+
+int max3010x_flush_fifo(const struct device *dev)
+{
+	const max3010x_config_t *cfg = dev->config;
+
+	/* Reset FIFO pointers and overflow counter */
+	if (max3010x_reg_write(cfg, MAX3010X_REG_FIFO_WR_PTR, 0))
+	{
+		return -EIO;
+	}
+	if (max3010x_reg_write(cfg, MAX3010X_REG_OVF_COUNTER, 0))
+	{
+		return -EIO;
+	}
+	if (max3010x_reg_write(cfg, MAX3010X_REG_FIFO_RD_PTR, 0))
+	{
+		return -EIO;
+	}
+
+	LOG_DBG("FIFO flushed");
+	return 0;
 }
 
 int max3010x_get_raw_channel(const struct device *dev,
@@ -487,133 +593,194 @@ int max3010x_init(const struct device *dev)
 	max3010x_runtime_t *rt = dev->data;
 	const max3010x_config_t *cfg = dev->config;
 	uint8_t part_id = 0;
+	int ret;
 
+	LOG_INF("Initializing MAX3010x at 0x%02x", cfg->i2c.addr);
+
+	/* Step 1: Verify I2C ready */
 	if (!device_is_ready(cfg->i2c.bus))
 	{
+		LOG_ERR("I2C bus not ready");
 		return -ENODEV;
 	}
 
-	if (cfg->int_gpio.port)
-	{
-		if (!gpio_is_ready_dt(&cfg->int_gpio))
-		{
-			return -ENODEV;
-		}
-
-		int ret = gpio_pin_configure_dt(&cfg->int_gpio, GPIO_INPUT);
-		if (ret < 0)
-		{
-			return ret;
-		}
-	}
-
-	if (max3010x_reg_read(cfg, MAX3010X_REG_PART_ID, &part_id))
-	{
-		return -EIO;
-	}
-
-	if (cfg->variant == MAX3010X_VARIANT_MAX30101 && part_id != MAX30101_PART_ID)
-	{
-		LOG_ERR("Unexpected part ID: 0x%02X", part_id);
-		return -ENODEV;
-	}
-	if (cfg->variant == MAX3010X_VARIANT_MAX30102 && part_id != MAX30102_PART_ID)
-	{
-		LOG_ERR("Unexpected part ID: 0x%02X", part_id);
-		return -ENODEV;
-	}
-
-	if (max3010x_reset(dev))
-	{
-		return -EIO;
-	}
-
-	if (max3010x_set_mode(dev, cfg->mode))
-	{
-		return -EIO;
-	}
-
-	if (max3010x_set_fifo_config(dev, &cfg->fifo))
-	{
-		return -EIO;
-	}
-
-	if (max3010x_set_spo2_config(dev, &cfg->spo2))
-	{
-		return -EIO;
-	}
-
-	if (max3010x_set_led_pa(dev, &cfg->led_pa))
-	{
-		return -EIO;
-	}
-
-	if (max3010x_set_slots(dev, &cfg->slots))
-	{
-		return -EIO;
-	}
-
-	if (max3010x_set_interrupts(dev, cfg->interrupts.int1_mask, cfg->interrupts.int2_mask))
-	{
-		return -EIO;
-	}
-
-	if (max3010x_set_prox_int_thresh(dev, cfg->prox_int_thresh))
-	{
-		return -EIO;
-	}
-
-	if (max3010x_set_temp_enable(dev, cfg->temp_enable))
-	{
-		return -EIO;
-	}
-
+	/* Initialize runtime state */
+	rt->dev = dev;
+	rt->int_callback = NULL;
+	rt->int_user_data = NULL;
+	atomic_set(&rt->sample_count, 0);
 	for (int i = 0; i < MAX3010X_MAX_NUM_CHANNELS; i++)
 	{
 		rt->data.raw[i] = 0;
 		rt->map.fifo_index[i] = MAX3010X_MAX_NUM_CHANNELS;
 	}
-	max3010x_build_channel_map(cfg, &rt->map);
+	rt->map.active_channels = 0;
 
+	/* Step 2: Read and verify part ID */
+	ret = max3010x_reg_read(cfg, MAX3010X_REG_PART_ID, &part_id);
+	if (ret)
+	{
+		LOG_ERR("Failed to read part ID");
+		return -EIO;
+	}
+
+	if (cfg->variant == MAX3010X_VARIANT_MAX30101 && part_id != MAX30101_PART_ID)
+	{
+		LOG_ERR("Unexpected part ID: 0x%02X (expected 0x%02X)", part_id, MAX30101_PART_ID);
+		return -ENODEV;
+	}
+	if (cfg->variant == MAX3010X_VARIANT_MAX30102 && part_id != MAX30102_PART_ID)
+	{
+		LOG_ERR("Unexpected part ID: 0x%02X (expected 0x%02X)", part_id, MAX30102_PART_ID);
+		return -ENODEV;
+	}
+	LOG_DBG("Part ID: 0x%02X", part_id);
+
+	/* Step 3: Soft reset and wait */
+	ret = max3010x_reset(dev);
+	if (ret)
+	{
+		LOG_ERR("Reset failed: %d", ret);
+		return ret;
+	}
+
+	/* Step 4: Apply Kconfig/DT defaults */
+	ret = max3010x_set_mode(dev, cfg->mode);
+	if (ret)
+	{
+		LOG_ERR("Failed to set mode");
+		return -EIO;
+	}
+
+	ret = max3010x_set_fifo_config(dev, &cfg->fifo);
+	if (ret)
+	{
+		LOG_ERR("Failed to set FIFO config");
+		return -EIO;
+	}
+
+	ret = max3010x_set_spo2_config(dev, &cfg->spo2);
+	if (ret)
+	{
+		LOG_ERR("Failed to set SpO2 config");
+		return -EIO;
+	}
+
+	ret = max3010x_set_led_pa(dev, &cfg->led_pa);
+	if (ret)
+	{
+		LOG_ERR("Failed to set LED currents");
+		return -EIO;
+	}
+
+	ret = max3010x_set_slots(dev, &cfg->slots);
+	if (ret)
+	{
+		LOG_ERR("Failed to set slots");
+		return -EIO;
+	}
+
+	/* Step 5: Put device in SHUTDOWN mode */
+	ret = max3010x_disable(dev);
+	if (ret)
+	{
+		LOG_ERR("Failed to enter shutdown");
+		return -EIO;
+	}
+
+	/* Step 6: Configure GPIO interrupt (but leave disabled) */
+#if IS_ENABLED(CONFIG_MAX3010X_IRQ_ENABLE)
+	if (cfg->int_gpio.port)
+	{
+		if (!gpio_is_ready_dt(&cfg->int_gpio))
+		{
+			LOG_ERR("GPIO not ready");
+			return -ENODEV;
+		}
+
+		ret = gpio_pin_configure_dt(&cfg->int_gpio, GPIO_INPUT);
+		if (ret < 0)
+		{
+			LOG_ERR("GPIO config failed: %d", ret);
+			return ret;
+		}
+
+		ret = gpio_pin_interrupt_configure_dt(&cfg->int_gpio, GPIO_INT_DISABLE);
+		if (ret < 0)
+		{
+			LOG_ERR("GPIO int disable failed: %d", ret);
+			return ret;
+		}
+
+		gpio_init_callback(&rt->gpio_cb, max3010x_gpio_handler, BIT(cfg->int_gpio.pin));
+		ret = gpio_add_callback(cfg->int_gpio.port, &rt->gpio_cb);
+		if (ret < 0)
+		{
+			LOG_ERR("GPIO callback failed: %d", ret);
+			return ret;
+		}
+		LOG_DBG("GPIO interrupt configured (disabled)");
+	}
+#else
+	/* IRQ support disabled via Kconfig - configure GPIO for polling only */
+	if (cfg->int_gpio.port)
+	{
+		if (!gpio_is_ready_dt(&cfg->int_gpio))
+		{
+			LOG_WRN("INT GPIO not ready (polling mode)");
+		}
+		else
+		{
+			ret = gpio_pin_configure_dt(&cfg->int_gpio, GPIO_INPUT);
+			if (ret < 0)
+			{
+				LOG_WRN("INT GPIO config failed: %d (polling unavailable)", ret);
+			}
+			else
+			{
+				LOG_DBG("INT GPIO configured for polling (IRQ disabled via Kconfig)");
+			}
+		}
+	}
+#endif /* CONFIG_MAX3010X_IRQ_ENABLE */
+
+	LOG_INF("MAX3010x ready (shutdown mode)");
 	return 0;
 }
 
 int max3010x_apply_default_config(const struct device *dev)
 {
 	const max3010x_config_t *cfg = dev->config;
+	int ret;
 
-	if (max3010x_set_mode(dev, cfg->mode))
+	ret = max3010x_set_mode(dev, cfg->mode);
+	if (ret)
 	{
-		return -EIO;
-	}
-	if (max3010x_set_fifo_config(dev, &cfg->fifo))
-	{
-		return -EIO;
-	}
-	if (max3010x_set_spo2_config(dev, &cfg->spo2))
-	{
-		return -EIO;
-	}
-	if (max3010x_set_led_pa(dev, &cfg->led_pa))
-	{
-		return -EIO;
-	}
-	if (max3010x_set_slots(dev, &cfg->slots))
-	{
-		return -EIO;
+		return ret;
 	}
 
-	if (max3010x_set_interrupts(dev, cfg->interrupts.int1_mask, cfg->interrupts.int2_mask))
+	ret = max3010x_set_fifo_config(dev, &cfg->fifo);
+	if (ret)
 	{
-		return -EIO;
+		return ret;
 	}
-	if (max3010x_set_prox_int_thresh(dev, cfg->prox_int_thresh))
+
+	ret = max3010x_set_spo2_config(dev, &cfg->spo2);
+	if (ret)
 	{
-		return -EIO;
+		return ret;
 	}
-	if (max3010x_set_temp_enable(dev, cfg->temp_enable))
+
+	ret = max3010x_set_led_pa(dev, &cfg->led_pa);
+	if (ret)
 	{
-		return -EIO;
+		return ret;
+	}
+
+	ret = max3010x_set_slots(dev, &cfg->slots);
+	if (ret)
+	{
+		return ret;
 	}
 
 	return 0;
@@ -627,6 +794,130 @@ static int max3010x_zephyr_init(const struct device *dev)
 		LOG_ERR("Init failed: %d", ret);
 	}
 	return ret;
+}
+
+/* --------------------------------------------------------------------------
+ * Interrupt Callback API Implementation
+ * -------------------------------------------------------------------------- */
+
+int max3010x_set_int_callback(const struct device *dev,
+			      max3010x_int_callback_t callback,
+			      void *user_data)
+{
+	if (!dev)
+	{
+		return -EINVAL;
+	}
+
+	max3010x_runtime_t *rt = dev->data;
+
+	rt->int_callback = callback;
+	rt->int_user_data = user_data;
+
+	return 0;
+}
+
+int max3010x_enable_int(const struct device *dev, bool enable)
+{
+	if (!dev)
+	{
+		return -EINVAL;
+	}
+
+#if !IS_ENABLED(CONFIG_MAX3010X_IRQ_ENABLE)
+	LOG_WRN("IRQ support disabled via Kconfig");
+	return -ENOTSUP;
+#else
+	const max3010x_config_t *cfg = dev->config;
+
+	if (!cfg->int_gpio.port)
+	{
+		LOG_DBG("INT GPIO not configured in devicetree");
+		return -ENOTSUP;
+	}
+
+	if (enable)
+	{
+		/* MAX30101 INT pin is active low, open drain */
+		LOG_DBG("Enabling INT GPIO interrupt");
+		return gpio_pin_interrupt_configure_dt(&cfg->int_gpio, GPIO_INT_EDGE_TO_ACTIVE);
+	}
+	else
+	{
+		LOG_DBG("Disabling INT GPIO interrupt");
+		return gpio_pin_interrupt_configure_dt(&cfg->int_gpio, GPIO_INT_DISABLE);
+	}
+#endif /* CONFIG_MAX3010X_IRQ_ENABLE */
+}
+
+uint32_t max3010x_get_sample_count(const struct device *dev)
+{
+	if (!dev)
+	{
+		return 0;
+	}
+
+	max3010x_runtime_t *rt = dev->data;
+	return atomic_get(&rt->sample_count);
+}
+
+void max3010x_reset_sample_count(const struct device *dev)
+{
+	if (!dev)
+	{
+		return;
+	}
+
+	max3010x_runtime_t *rt = dev->data;
+	atomic_set(&rt->sample_count, 0);
+}
+
+uint32_t max3010x_get_and_reset_sample_count(const struct device *dev)
+{
+	if (!dev)
+	{
+		return 0;
+	}
+
+	max3010x_runtime_t *rt = dev->data;
+	return atomic_clear(&rt->sample_count);
+}
+
+int max3010x_read_int_gpio(const struct device *dev, int *state)
+{
+	if (!dev || !state)
+	{
+		return -EINVAL;
+	}
+
+	const max3010x_config_t *cfg = dev->config;
+
+	if (!cfg->int_gpio.port)
+	{
+		LOG_DBG("INT GPIO not configured");
+		return -ENOTSUP;
+	}
+
+	int gpio_state = gpio_pin_get_dt(&cfg->int_gpio);
+	if (gpio_state < 0)
+	{
+		LOG_ERR("Failed to read INT GPIO: %d", gpio_state);
+		return gpio_state;
+	}
+
+	*state = gpio_state;
+	return 0;
+}
+
+bool max3010x_has_int_gpio(const struct device *dev)
+{
+	if (!dev)
+	{
+		return false;
+	}
+
+	const max3010x_config_t *cfg = dev->config;
+	return cfg->int_gpio.port != NULL;
 }
 
 #define MAX3010X_VARIANT_FROM_DT(node_id)                                    \

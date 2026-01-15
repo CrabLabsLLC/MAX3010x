@@ -10,128 +10,225 @@ menuconfig MAX3010X
 	select SENSOR
 	help
 	  Enable the MAX3010x driver (MAX30101/MAX30102).
-	  Defaults set here are applied at init, and can be overridden at runtime.
+	  These defaults are applied at init. Use runtime API to change settings.
 
 if MAX3010X
+
+# --- Operating Mode ---
 
 choice MAX3010X_MODE
 	prompt "Operating mode"
 	default MAX3010X_MODE_MULTI_LED
+	help
+	  Select the default operating mode.
+	  Multi-LED mode is recommended for full control over which LEDs are active.
 
 config MAX3010X_MODE_HEART_RATE
-	bool "Heart rate mode"
+	bool "Heart rate mode (Red LED only)"
 
 config MAX3010X_MODE_SPO2
-	bool "SpO2 mode"
+	bool "SpO2 mode (Red + IR)"
 
 config MAX3010X_MODE_MULTI_LED
-	bool "Multi-LED mode"
+	bool "Multi-LED mode (configurable slots)"
 
 endchoice
 
-config MAX3010X_SAMPLE_AVG
-	int "Sample averaging"
+# --- Sample Rate and ADC ---
+
+config MAX3010X_SAMPLE_RATE
+	int "Sample rate (0-7)"
 	range 0 7
 	default 0
 	help
-	  0 = 1 sample, 1 = 2 samples, 2 = 4 samples, 3 = 8 samples,
-	  4 = 16 samples, 5-7 = 32 samples.
+	  Sample rate selection:
+	    0 = 50 Hz (default, good for MVP)
+	    1 = 100 Hz
+	    2 = 200 Hz
+	    3 = 400 Hz
+	    4 = 800 Hz
+	    5 = 1000 Hz
+	    6 = 1600 Hz
+	    7 = 3200 Hz
+
+config MAX3010X_PULSE_WIDTH
+	int "LED pulse width (0-3)"
+	range 0 3
+	default 3
+	help
+	  LED pulse width selection (affects ADC resolution):
+	    0 = 69us (15-bit ADC)
+	    1 = 118us (16-bit ADC)
+	    2 = 215us (17-bit ADC)
+	    3 = 411us (18-bit ADC, default, max resolution)
+
+config MAX3010X_ADC_RANGE
+	int "ADC full-scale range (0-3)"
+	range 0 3
+	default 2
+	help
+	  ADC range selection (higher = more headroom, less sensitivity):
+	    0 = 7.81 pA/LSB (2048 nA full scale)
+	    1 = 15.63 pA/LSB (4096 nA full scale)
+	    2 = 31.25 pA/LSB (8192 nA full scale, default)
+	    3 = 62.5 pA/LSB (16384 nA full scale)
+
+# --- FIFO Configuration ---
+
+config MAX3010X_SAMPLE_AVG
+	int "Sample averaging (0-7)"
+	range 0 7
+	default 0
+	help
+	  Number of samples to average before storing in FIFO:
+	    0 = 1 sample (no averaging, default)
+	    1 = 2 samples
+	    2 = 4 samples
+	    3 = 8 samples
+	    4 = 16 samples
+	    5-7 = 32 samples
 
 config MAX3010X_FIFO_ROLLOVER_EN
 	bool "FIFO rollover enable"
 	default y
+	help
+	  When enabled, FIFO overwrites oldest data when full.
+	  When disabled, FIFO stops accepting new data when full.
 
 config MAX3010X_FIFO_A_FULL
-	int "FIFO almost full threshold"
+	int "FIFO almost-full threshold (0-15)"
 	range 0 15
 	default 8
-
-config MAX3010X_ADC_RANGE
-	int "ADC range"
-	range 0 3
-	default 2
 	help
-	  0=7.81 pA/LSB, 1=15.63 pA/LSB, 2=31.25 pA/LSB, 3=62.5 pA/LSB
+	  Number of empty FIFO slots when almost-full interrupt triggers.
+	  FIFO depth is 32 samples, so 8 means interrupt at 24 samples.
 
-config MAX3010X_SAMPLE_RATE
-	int "Sample rate"
-	range 0 7
-	default 0
-	help
-	  0=50Hz, 1=100Hz, 2=200Hz, 3=400Hz, 4=800Hz, 5=1000Hz, 6=1600Hz, 7=3200Hz
-
-config MAX3010X_PULSE_WIDTH
-	int "Pulse width"
-	range 0 3
-	default 3
-	help
-	  0=69us (15-bit), 1=118us (16-bit), 2=215us (17-bit), 3=411us (18-bit)
+# --- LED Currents ---
+# 0x00 = 0mA, 0xFF = 51mA (0.2mA per LSB)
+# Default: ~10mA for Red/IR, ~6mA for Green (lower power for neonatal)
 
 config MAX3010X_LED1_PA
-	hex "LED1 (red) pulse amplitude"
+	hex "LED1 (Red) pulse amplitude"
 	range 0 0xff
-	default 0x33
+	default 0x32
+	help
+	  Red LED current: 0x00=0mA to 0xFF=51mA (0.2mA/LSB).
+	  Default 0x32 = 10mA, suitable for neonatal skin.
 
 config MAX3010X_LED2_PA
 	hex "LED2 (IR) pulse amplitude"
 	range 0 0xff
-	default 0x33
+	default 0x32
+	help
+	  IR LED current: 0x00=0mA to 0xFF=51mA (0.2mA/LSB).
+	  Default 0x32 = 10mA.
 
 config MAX3010X_LED3_PA
-	hex "LED3 (green) pulse amplitude"
+	hex "LED3 (Green) pulse amplitude"
 	range 0 0xff
-	default 0x00
+	default 0x1E
+	help
+	  Green LED current: 0x00=0mA to 0xFF=51mA (0.2mA/LSB).
+	  Default 0x1E = 6mA. Only used on MAX30101.
 
 config MAX3010X_LED4_PA
-	hex "LED4 (green) pulse amplitude"
+	hex "LED4 (Green2) pulse amplitude"
 	range 0 0xff
 	default 0x00
+	help
+	  Second green LED current (MAX30101 only).
+	  Default 0x00 = disabled.
 
 config MAX3010X_PILOT_PA
 	hex "Pilot LED pulse amplitude"
 	range 0 0xff
 	default 0x00
+	help
+	  Pilot LED current for proximity detection.
+	  Default 0x00 = disabled.
+
+# --- Multi-LED Slot Configuration ---
+# Slot values: 0=disabled, 1=RED, 2=IR, 3=GREEN, 5=RED_pilot, 6=IR_pilot, 7=GREEN_pilot
 
 config MAX3010X_SLOT1
-	int "Slot 1 selection"
+	int "Slot 1 LED selection (0-7)"
 	range 0 7
 	default 1
 	help
-	  0=disabled, 1=RED, 2=IR, 3=GREEN, 4=disabled, 5=RED pilot,
-	  6=IR pilot, 7=GREEN pilot.
+	  First time slot LED:
+	    0 = Disabled
+	    1 = Red (LED1_PA)
+	    2 = IR (LED2_PA)
+	    3 = Green (LED3_PA)
+	    5 = Red pilot (PILOT_PA)
+	    6 = IR pilot (PILOT_PA)
+	    7 = Green pilot (PILOT_PA)
 
 config MAX3010X_SLOT2
-	int "Slot 2 selection"
+	int "Slot 2 LED selection (0-7)"
 	range 0 7
 	default 2
+	help
+	  Second time slot LED. Default: IR.
 
 config MAX3010X_SLOT3
-	int "Slot 3 selection"
+	int "Slot 3 LED selection (0-7)"
 	range 0 7
-	default 0
+	default 3
+	help
+	  Third time slot LED. Default: Green (for MAX30101 3-LED operation).
 
 config MAX3010X_SLOT4
-	int "Slot 4 selection"
+	int "Slot 4 LED selection (0-7)"
 	range 0 7
 	default 0
+	help
+	  Fourth time slot LED. Default: Disabled.
+
+# --- Interrupts (runtime configuration recommended) ---
 
 config MAX3010X_INT_ENABLE_1
 	hex "Interrupt enable 1 mask"
 	range 0 0xff
 	default 0x00
+	help
+	  Interrupt enable register 1 default value.
+	  Usually configured at runtime via max3010x_set_interrupts().
+	  Bit 7: FIFO almost full
+	  Bit 6: New data ready
+	  Bit 5: Ambient light overflow
+	  Bit 4: Proximity interrupt
 
 config MAX3010X_INT_ENABLE_2
 	hex "Interrupt enable 2 mask"
 	range 0 0xff
 	default 0x00
+	help
+	  Interrupt enable register 2 default value.
+	  Bit 1: Die temperature ready
 
 config MAX3010X_PROX_INT_THRESH
 	hex "Proximity interrupt threshold"
 	range 0 0xff
 	default 0x00
+	help
+	  Proximity detection threshold (0x00 = disabled).
 
 config MAX3010X_TEMP_ENABLE
-	bool "Enable die temperature conversions"
+	bool "Enable die temperature at init"
 	default n
+	help
+	  Start temperature conversion at init. Usually not needed.
+
+# --- IRQ Configuration ---
+
+config MAX3010X_IRQ_ENABLE
+	bool "Enable interrupt GPIO support"
+	default y
+	help
+	  Enable support for the INT pin interrupt functionality.
+	  When disabled, the driver will not configure or use the INT GPIO
+	  even if specified in devicetree. Use polling mode instead.
+	  Disable this if the INT pin is not connected or not needed.
 
 endif # MAX3010X
