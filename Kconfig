@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Makani Science
+# Copyright (c) 2025 Crab Labs LLC
 # SPDX-License-Identifier: Apache-2.0
 
 menuconfig MAX3010X
@@ -13,6 +13,21 @@ menuconfig MAX3010X
 	  These defaults are applied at init. Use runtime API to change settings.
 
 if MAX3010X
+
+config MAX3010X_INIT_PRIORITY
+	int "MAX3010x initialization priority"
+	default 90
+	help
+	  Device initialization priority for MAX3010x.
+	  Should be higher than I2C bus priority.
+
+config MAX3010X_LOG_LEVEL
+	int "MAX3010x log level"
+	default 3
+	range 0 4
+	help
+	  Sets log level for MAX3010x driver.
+	  0 = OFF, 1 = ERR, 2 = WRN, 3 = INF, 4 = DBG
 
 # --- Operating Mode ---
 
