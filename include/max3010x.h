@@ -313,6 +313,9 @@ int max3010xGetRevisionID(const struct device* const dev, uint8_t* const rev_id)
  *       hardware interrupt source. Failure to do so may cause the interrupt
  *       to stop firing on edge-triggered GPIOs.
  *
+ * @note This function disables the GPIO interrupt during callback swap.
+ *       Caller must call max3010xEnableInterrupt() afterwards to re-enable it.
+ *
  * @param[in] dev       Zephyr device handle
  * @param[in] callback  Function to call, or NULL to disable
  * @param[in] user_data Context pointer passed to callback
@@ -387,4 +390,4 @@ bool max3010xHasInterruptGPIO(const struct device* const dev);
 }
 #endif
 
-#endif /* MAX3010X_H */
+#endif // MAX3010X_H

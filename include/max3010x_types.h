@@ -178,4 +178,4 @@ typedef void (*MAX3010xCallback)(void* user_data);
 }
 #endif
 
-#endif /* MAX3010X_TYPES_H */
+#endif // MAX3010X_TYPES_H

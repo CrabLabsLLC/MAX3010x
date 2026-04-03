@@ -25,43 +25,43 @@ extern "C" {
  * Register Addresses
  * ============================================================================ */
 
-/* Interrupt */
+// Interrupt
 #define MAX3010X_REG_INT_STATUS_1        0x00
 #define MAX3010X_REG_INT_STATUS_2        0x01
 #define MAX3010X_REG_INT_ENABLE_1        0x02
 #define MAX3010X_REG_INT_ENABLE_2        0x03
 
-/* FIFO */
+// FIFO
 #define MAX3010X_REG_FIFO_WR_PTR         0x04
 #define MAX3010X_REG_OVF_COUNTER         0x05
 #define MAX3010X_REG_FIFO_RD_PTR         0x06
 #define MAX3010X_REG_FIFO_DATA           0x07
 
-/* Configuration */
+// Configuration
 #define MAX3010X_REG_FIFO_CONFIG         0x08
 #define MAX3010X_REG_MODE_CONFIG         0x09
 #define MAX3010X_REG_SPO2_CONFIG         0x0A
 
-/* LED Pulse Amplitude */
+// LED Pulse Amplitude
 #define MAX3010X_REG_LED1_PA             0x0C
 #define MAX3010X_REG_LED2_PA             0x0D
 #define MAX3010X_REG_LED3_PA             0x0E
 #define MAX3010X_REG_LED4_PA             0x0F
 #define MAX3010X_REG_PILOT_PA            0x10
 
-/* Multi-LED Mode Control */
+// Multi-LED Mode Control
 #define MAX3010X_REG_MULTI_LED_CTRL1     0x11
 #define MAX3010X_REG_MULTI_LED_CTRL2     0x12
 
-/* Temperature */
+// Temperature
 #define MAX3010X_REG_TEMP_INT            0x1F
 #define MAX3010X_REG_TEMP_FRAC           0x20
 #define MAX3010X_REG_TEMP_CONFIG         0x21
 
-/* Proximity */
+// Proximity
 #define MAX3010X_REG_PROX_INT_THRESH     0x30
 
-/* Part ID */
+// Part ID
 #define MAX3010X_REG_REV_ID              0xFE
 #define MAX3010X_REG_PART_ID             0xFF
 
@@ -79,11 +79,11 @@ extern "C" {
  * INT_STATUS_1 / INT_ENABLE_1 Bit Fields
  * ============================================================================ */
 
-#define MAX3010X_INT_PWR_RDY             0x01   /* Power ready (STATUS ONLY, no enable bit) */
-#define MAX3010X_INT_PROX_INT            0x10   /* Proximity interrupt (MAX30101 only) */
-#define MAX3010X_INT_ALC_OVF             0x20   /* Ambient light cancellation overflow */
-#define MAX3010X_INT_PPG_RDY             0x40   /* New FIFO sample ready */
-#define MAX3010X_INT_A_FULL              0x80   /* FIFO almost full */
+#define MAX3010X_INT_PWR_RDY             0x01   // Power ready (STATUS ONLY, no enable bit)
+#define MAX3010X_INT_PROX_INT            0x10   // Proximity interrupt (MAX30101 only)
+#define MAX3010X_INT_ALC_OVF             0x20   // Ambient light cancellation overflow
+#define MAX3010X_INT_PPG_RDY             0x40   // New FIFO sample ready
+#define MAX3010X_INT_A_FULL              0x80   // FIFO almost full
 
 #define MAX3010X_INT_EN_PROX_INT         0x10
 #define MAX3010X_INT_EN_ALC_OVF          0x20
@@ -110,9 +110,9 @@ extern "C" {
  * MODE_CONFIG Bit Fields
  * ============================================================================ */
 
-#define MAX3010X_MODE_SHDN               0x80   /* Shutdown control */
-#define MAX3010X_MODE_RESET              0x40   /* Reset control */
-#define MAX3010X_MODE_MASK               0x07   /* Mode bits [2:0] */
+#define MAX3010X_MODE_SHDN               0x80   // Shutdown control
+#define MAX3010X_MODE_RESET              0x40   // Reset control
+#define MAX3010X_MODE_MASK               0x07   // Mode bits [2:0]
 
 /* ============================================================================
  * SPO2_CONFIG Bit Fields
@@ -146,8 +146,8 @@ extern "C" {
  * FIFO Pointer / Overflow Masks
  * ============================================================================ */
 
-#define MAX3010X_FIFO_PTR_MASK           0x1F   /* 5-bit FIFO pointer (0-31) */
-#define MAX3010X_OVF_COUNTER_MASK        0x1F   /* 5-bit overflow counter (saturates at 31) */
+#define MAX3010X_FIFO_PTR_MASK           0x1F   // 5-bit FIFO pointer (0-31)
+#define MAX3010X_OVF_COUNTER_MASK        0x1F   // 5-bit overflow counter (saturates at 31)
 
 /* ============================================================================
  * FIFO Data Constants
@@ -156,8 +156,8 @@ extern "C" {
 #define MAX3010X_FIFO_DATA_BITS          18
 #define MAX3010X_FIFO_DATA_MASK          0x3FFFF
 #define MAX3010X_BYTES_PER_CHANNEL       3
-#define MAX3010X_MAX_NUM_CHANNELS        3      /* Distinct LED types: Red, IR, Green */
-#define MAX3010X_MAX_NUM_SLOTS           4      /* Multi-LED mode has 4 time slots */
+#define MAX3010X_MAX_NUM_CHANNELS        3      // Distinct LED types: Red, IR, Green
+#define MAX3010X_MAX_NUM_SLOTS           4      // Multi-LED mode has 4 time slots
 #define MAX3010X_FIFO_DEPTH              32
 
 /* ============================================================================
@@ -171,4 +171,4 @@ extern "C" {
 }
 #endif
 
-#endif /* MAX3010X_REGS_H */
+#endif // MAX3010X_REGS_H
