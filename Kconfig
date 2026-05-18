@@ -29,7 +29,7 @@ config MAX3010X_LOG_LEVEL
 	  Sets log level for MAX3010x driver.
 	  0 = OFF, 1 = ERR, 2 = WRN, 3 = INF, 4 = DBG
 
-# --- Operating Mode ---
+# Operating Mode
 
 choice MAX3010X_MODE
 	prompt "Operating mode"
@@ -49,7 +49,7 @@ config MAX3010X_MODE_MULTI_LED
 
 endchoice
 
-# --- Sample Rate and ADC ---
+# Sample Rate and ADC
 
 config MAX3010X_SAMPLE_RATE
 	int "Sample rate (0-7)"
@@ -88,7 +88,7 @@ config MAX3010X_ADC_RANGE
 	    2 = 31.25 pA/LSB (8192 nA full scale, default)
 	    3 = 62.5 pA/LSB (16384 nA full scale)
 
-# --- FIFO Configuration ---
+# FIFO Configuration
 
 config MAX3010X_SAMPLE_AVG
 	int "Sample averaging (0-7)"
@@ -118,7 +118,7 @@ config MAX3010X_FIFO_A_FULL
 	  Number of empty FIFO slots when almost-full interrupt triggers.
 	  FIFO depth is 32 samples, so 8 means interrupt at 24 samples.
 
-# --- LED Currents ---
+# LED Currents
 # 0x00 = 0mA, 0xFF = 51mA (0.2mA per LSB)
 # Default: ~10mA for Red/IR, ~6mA for Green (lower power for neonatal)
 
@@ -162,7 +162,7 @@ config MAX3010X_PILOT_PA
 	  Pilot LED current for proximity detection.
 	  Default 0x00 = disabled.
 
-# --- Multi-LED Slot Configuration ---
+# Multi-LED Slot Configuration
 # Slot values: 0=disabled, 1=RED, 2=IR, 3=GREEN, 5=RED_pilot, 6=IR_pilot, 7=GREEN_pilot
 
 config MAX3010X_SLOT1
@@ -200,7 +200,7 @@ config MAX3010X_SLOT4
 	help
 	  Fourth time slot LED. Default: Disabled.
 
-# --- Interrupts (runtime configuration recommended) ---
+# Interrupts (runtime configuration recommended)
 
 config MAX3010X_INT_ENABLE_1
 	hex "Interrupt enable 1 mask"
@@ -235,7 +235,7 @@ config MAX3010X_TEMP_ENABLE
 	help
 	  Start temperature conversion at init. Usually not needed.
 
-# --- IRQ Configuration ---
+# IRQ Configuration
 
 config MAX3010X_IRQ_ENABLE
 	bool "Enable interrupt GPIO support"
