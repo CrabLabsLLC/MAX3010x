@@ -63,11 +63,11 @@ extern "C"
 
 #define MAX3010X_PART_ID 0x15
 
-#define MAX3010X_INT_PWR_RDY 0x01  // Power ready (STATUS ONLY, no enable bit)
+#define MAX3010X_INT_PWR_RDY 0x01 // Power ready (STATUS ONLY, no enable bit)
 #define MAX3010X_INT_PROX_INT 0x10 // Proximity interrupt (MAX30101 only)
-#define MAX3010X_INT_ALC_OVF 0x20  // Ambient light cancellation overflow
-#define MAX3010X_INT_PPG_RDY 0x40  // New FIFO sample ready
-#define MAX3010X_INT_A_FULL 0x80   // FIFO almost full
+#define MAX3010X_INT_ALC_OVF 0x20 // Ambient light cancellation overflow
+#define MAX3010X_INT_PPG_RDY 0x40 // New FIFO sample ready
+#define MAX3010X_INT_A_FULL 0x80 // FIFO almost full
 
 #define MAX3010X_INT_EN_PROX_INT 0x10
 #define MAX3010X_INT_EN_ALC_OVF 0x20
@@ -82,9 +82,9 @@ extern "C"
 #define MAX3010X_FIFO_ROLLOVER_EN 0x10
 #define MAX3010X_FIFO_A_FULL_MASK 0x0F
 
-#define MAX3010X_MODE_SHDN 0x80	 // Shutdown control
+#define MAX3010X_MODE_SHDN 0x80 // Shutdown control
 #define MAX3010X_MODE_RESET 0x40 // Reset control
-#define MAX3010X_MODE_MASK 0x07	 // Mode bits [2:0]
+#define MAX3010X_MODE_MASK 0x07 // Mode bits [2:0]
 
 #define MAX3010X_SPO2_ADC_RANGE_SHIFT 5
 #define MAX3010X_SPO2_ADC_RANGE_MASK 0x60
@@ -102,14 +102,14 @@ extern "C"
 #define MAX3010X_TEMP_EN 0x01
 #define MAX3010X_TEMP_FRAC_MASK 0x0F
 
-#define MAX3010X_FIFO_PTR_MASK 0x1F	   // 5-bit FIFO pointer (0-31)
+#define MAX3010X_FIFO_PTR_MASK 0x1F // 5-bit FIFO pointer (0-31)
 #define MAX3010X_OVF_COUNTER_MASK 0x1F // 5-bit overflow counter (saturates at 31)
 
 #define MAX3010X_FIFO_DATA_BITS 18
 #define MAX3010X_FIFO_DATA_MASK 0x3FFFF
 #define MAX3010X_BYTES_PER_CHANNEL 3
 #define MAX3010X_MAX_NUM_CHANNELS 3 // Distinct LED types: Red, IR, Green
-#define MAX3010X_MAX_NUM_SLOTS 4	// Multi-LED mode has 4 time slots
+#define MAX3010X_MAX_NUM_SLOTS 4 // Multi-LED mode has 4 time slots
 #define MAX3010X_FIFO_DEPTH 32
 
 #define MAX3010X_RESET_TIMEOUT_MS 100

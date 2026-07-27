@@ -147,12 +147,12 @@ config MAX3010X_LED3_PA
 	  Default 0x1E = 6mA. Only used on MAX30101.
 
 config MAX3010X_LED4_PA
-	hex "LED4 (Green2) pulse amplitude"
+	hex "LED4 (second green current sink) pulse amplitude"
 	range 0 0xff
-	default 0x00
+	default 0x1E
 	help
-	  Second green LED current (MAX30101 only).
-	  Default 0x00 = disabled.
+	  Second current sink for the same green LED (MAX30101 only).
+	  Default 0x1E matches LED3 at 6mA.
 
 config MAX3010X_PILOT_PA
 	hex "Pilot LED pulse amplitude"
@@ -163,39 +163,38 @@ config MAX3010X_PILOT_PA
 	  Default 0x00 = disabled.
 
 # Multi-LED Slot Configuration
-# Slot values: 0=disabled, 1=RED, 2=IR, 3=GREEN, 5=RED_pilot, 6=IR_pilot, 7=GREEN_pilot
+# Slot values: 0=disabled, 1=RED, 2=IR, 3=GREEN (MAX30101 only)
 
 config MAX3010X_SLOT1
-	int "Slot 1 LED selection (0-7)"
-	range 0 7
+	int "Slot 1 LED selection (0-3)"
+	range 0 3
 	default 1
 	help
 	  First time slot LED:
 	    0 = Disabled
 	    1 = Red (LED1_PA)
 	    2 = IR (LED2_PA)
-	    3 = Green (LED3_PA)
-	    5 = Red pilot (PILOT_PA)
-	    6 = IR pilot (PILOT_PA)
-	    7 = Green pilot (PILOT_PA)
+	    3 = Green (MAX30101 only, LED3_PA + LED4_PA)
+
+	  Enabled slots must be contiguous from slot 1.
 
 config MAX3010X_SLOT2
-	int "Slot 2 LED selection (0-7)"
-	range 0 7
+	int "Slot 2 LED selection (0-3)"
+	range 0 3
 	default 2
 	help
 	  Second time slot LED. Default: IR.
 
 config MAX3010X_SLOT3
-	int "Slot 3 LED selection (0-7)"
-	range 0 7
-	default 3
+	int "Slot 3 LED selection (0-3)"
+	range 0 3
+	default 0
 	help
-	  Third time slot LED. Default: Green (for MAX30101 3-LED operation).
+	  Third time slot LED. Green is available only on MAX30101.
 
 config MAX3010X_SLOT4
-	int "Slot 4 LED selection (0-7)"
-	range 0 7
+	int "Slot 4 LED selection (0-3)"
+	range 0 3
 	default 0
 	help
 	  Fourth time slot LED. Default: Disabled.

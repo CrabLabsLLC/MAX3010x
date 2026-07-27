@@ -23,6 +23,8 @@
 
 #define DT_DRV_COMPAT maxim_max3010x
 
+#include <string.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -31,7 +33,6 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
-#include <zephyr/sys/atomic.h>
 
 #include "max3010x.h"
 
@@ -40,42 +41,46 @@ LOG_MODULE_REGISTER(max3010x, CONFIG_MAX3010X_LOG_LEVEL);
 /** @brief Per-instance immutable config (from DT + Kconfig) */
 typedef struct
 {
-	struct i2c_dt_spec i2c;				   ///< I2C bus and address
-	struct gpio_dt_spec int_gpio;		   ///< Interrupt GPIO (optional)
-	MAX3010xVariant variant;			   ///< MAX30101 or MAX30102
-	MAX3010xMode mode;					   ///< Default operating mode
-	MAX3010xFIFOConfig fifo;			   ///< FIFO configuration
-	MAX3010xSPO2Config spo2;			   ///< SpO2/PPG ADC configuration
-	MAX3010xSlotConfig slots;			   ///< Multi-LED slot configuration
-	MAX3010xLEDAmplitude led_amplitude;	   ///< LED pulse amplitudes
-	uint8_t interrupt_enable_1_mask;	   ///< INT_ENABLE_1 register value
-	uint8_t interrupt_enable_2_mask;	   ///< INT_ENABLE_2 register value
+	struct i2c_dt_spec i2c; ///< I2C bus and address
+	struct gpio_dt_spec int_gpio; ///< Interrupt GPIO (optional)
+	MAX3010xVariant variant; ///< MAX30101 or MAX30102
+	MAX3010xMode mode; ///< Default operating mode
+	MAX3010xFIFOConfig fifo; ///< FIFO configuration
+	MAX3010xSPO2Config spo2; ///< SpO2/PPG ADC configuration
+	MAX3010xSlotConfig slots; ///< Multi-LED slot configuration
+	MAX3010xLEDAmplitude led_amplitude; ///< LED pulse amplitudes
+	uint8_t interrupt_enable_1_mask; ///< INT_ENABLE_1 register value
+	uint8_t interrupt_enable_2_mask; ///< INT_ENABLE_2 register value
 	uint8_t proximity_interrupt_threshold; ///< Proximity interrupt threshold
-	bool is_temp_enabled;				   ///< Enable die temperature conversion
+	bool is_temp_enabled; ///< Enable die temperature conversion
 } MAX3010xDriverConfig;
 
 /** @brief Per-instance mutable driver state */
 typedef struct
 {
-	MAX3010xData data;			   ///< Most recent FIFO sample data
-	MAX3010xChannelMap map;		   ///< LED channel to FIFO index mapping
+	MAX3010xData data; ///< Most recent FIFO sample data
+	MAX3010xChannelMap map; ///< LED channel to FIFO index mapping
 	MAX3010xCallback int_callback; ///< Application interrupt callback
-	void* int_user_data;		   ///< User context for interrupt callback
-	struct gpio_callback gpio_cb;  ///< Zephyr GPIO callback structure
-	atomic_t sample_count;		   ///< Interrupt event counter
-	const struct device* dev;	   ///< Back-reference to owning device
-	struct k_mutex lock;		   ///< Shared register transaction lock
-	uint8_t current_mode;		   ///< Current MODE bits [2:0] (cached to avoid RMW)
-	uint8_t saved_led[5];		   ///< LED amp cache: [0]=LED1, [1]=LED2, [2]=LED3, [3]=LED4, [4]=PILOT
-	bool is_initialized;		   ///< Initialization complete flag
+	void* int_user_data; ///< User context for interrupt callback
+	struct gpio_callback gpio_cb; ///< Zephyr GPIO callback structure
+	struct k_mutex lock; ///< Shared register transaction lock
+	uint8_t current_mode; ///< Current MODE bits [2:0] (cached to avoid RMW)
+	uint8_t available_samples; ///< Last pointer-derived FIFO sample count
+	bool fifo_activity; ///< FIFO data observed since the last read or flush
 } MAX3010xDriverData;
 
 static int max3010xRegisterRead(const struct device* const dev, const uint8_t register_address, uint8_t* const value);
 static int max3010xRegisterWrite(const struct device* const dev, const uint8_t register_address, const uint8_t value);
 static int max3010xRegisterWriteVerify(const struct device* const dev, const uint8_t register_address, const uint8_t value, const uint8_t mask);
 static int max3010xRegisterReadBurst(const struct device* const dev, const uint8_t register_address, uint8_t* const buffer, const size_t length);
-static void max3010xBuildChannelMap(const MAX3010xDriverConfig* const cfg, const MAX3010xSlotConfig* const slots, MAX3010xChannelMap* const map);
-static MAX3010xSlot max3010xSanitizeSlot(const MAX3010xDriverConfig* const cfg, const MAX3010xSlot slot);
+static bool max3010xModeIsValid(const MAX3010xMode mode);
+static bool max3010xFIFOAverageIsValid(const MAX3010xFIFOAverage average);
+static bool max3010xADCRangeIsValid(const MAX3010xADCRange range);
+static bool max3010xSampleRateIsValid(const MAX3010xSampleRate rate);
+static bool max3010xPulseWidthIsValid(const MAX3010xPulseWidth width);
+static int max3010xValidateSlots(const MAX3010xDriverConfig* const cfg, const MAX3010xSlotConfig* const slots);
+static void max3010xBuildChannelMap(const MAX3010xSlotConfig* const slots, MAX3010xChannelMap* const map);
+static void max3010xRecordFIFORead(MAX3010xDriverData* const data, const size_t samples_read);
 static bool max3010xHasGPIO(const struct gpio_dt_spec* const spec);
 static void max3010xIntGPIOHandler(const struct device* const port, struct gpio_callback* const gpio_callback, const gpio_port_pins_t pins);
 
@@ -144,6 +149,15 @@ int max3010xReset(const struct device* const dev)
 	(void)max3010xRegisterRead(dev, MAX3010X_REG_INT_STATUS_1, &int1_status);
 	(void)max3010xRegisterRead(dev, MAX3010X_REG_INT_STATUS_2, &int2_status);
 
+	MAX3010xDriverData* const data = dev->data;
+	memset(&data->data, 0, sizeof(data->data));
+	for (size_t channel = 0; channel < MAX3010X_MAX_NUM_CHANNELS; channel++)
+		data->map.fifo_index[channel] = MAX3010X_MAX_NUM_SLOTS;
+	data->map.active_channel_count = 0;
+	data->current_mode = 0;
+	data->available_samples = 0;
+	data->fifo_activity = false;
+
 	LOG_DBG("Reset complete (int1=0x%02x, int2=0x%02x)", int1_status, int2_status);
 	return 0;
 }
@@ -154,70 +168,35 @@ int max3010xEnable(const struct device* const dev)
 		return -EINVAL;
 
 	MAX3010xDriverData* const data = dev->data;
-	const MAX3010xDriverConfig* const cfg = dev->config;
+	if (!max3010xModeIsValid((MAX3010xMode)data->current_mode))
+		return -EAGAIN;
+
 	const uint8_t mode_register_value = data->current_mode & MAX3010X_MODE_MASK;
 
-	/*
-	 * Wake from shutdown by clearing the SHDN bit.
-	 *
-	 * All configuration registers persist through shutdown (per datasheet).
-	 * Init writes FIFO/SpO2/LED/slot config, then enters SHDN|MODE.
-	 * We just clear SHDN here to resume sampling.
-	 *
-	 * NOTE: If mode activation triggers a register reset (observed on
-	 * some defective parts), the verify step below detects it and
-	 * reconfigures from cached state.
-	 */
-	const int ret = max3010xRegisterWrite(dev, MAX3010X_REG_MODE_CONFIG, mode_register_value);
+	int ret = max3010xFlushFIFO(dev);
 	if (ret < 0)
-	{
-		LOG_ERR("Enable write failed: %d", ret);
 		return ret;
-	}
 
-	k_msleep(5);
-
-	// Verify config survived the SHDN->active transition
-	uint8_t mode_readback = 0;
-	uint8_t spo2_readback = 0;
-	max3010xRegisterRead(dev, MAX3010X_REG_MODE_CONFIG, &mode_readback);
-	max3010xRegisterRead(dev, MAX3010X_REG_SPO2_CONFIG, &spo2_readback);
-
-	if ((mode_readback & MAX3010X_MODE_MASK) != mode_register_value || spo2_readback == 0x00)
-	{
-		LOG_WRN("Config lost after mode activation - reconfiguring");
-
-		// Reconfigure: reset -> full config -> mode last
-		const int reset_ret = max3010xReset(dev);
-		if (reset_ret < 0)
-		{
-			LOG_ERR("Recovery reset failed: %d", reset_ret);
-			return reset_ret;
-		}
-		max3010xSetFIFOConfig(dev, &cfg->fifo);
-		max3010xSetSPO2Config(dev, &cfg->spo2);
-
-		const MAX3010xLEDAmplitude leds =
-			{
-				.red = data->saved_led[0],
-				.ir = data->saved_led[1],
-				.green = data->saved_led[2],
-				.green2 = data->saved_led[3],
-				.pilot = data->saved_led[4],
-			};
-		max3010xSetLEDAmplitude(dev, &leds);
-		max3010xSetSlots(dev, &cfg->slots);
-		max3010xRegisterWrite(dev, MAX3010X_REG_MODE_CONFIG, mode_register_value);
-		k_msleep(5);
-	}
-
-	// Clear interrupt status
 	uint8_t int_clear = 0;
-	(void)max3010xRegisterRead(dev, MAX3010X_REG_INT_STATUS_1, &int_clear);
-	(void)max3010xRegisterRead(dev, MAX3010X_REG_INT_STATUS_2, &int_clear);
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_INT_STATUS_1, &int_clear);
+	if (ret < 0)
+		return ret;
 
-	// Flush FIFO for clean data stream
-	max3010xFlushFIFO(dev);
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_INT_STATUS_2, &int_clear);
+	if (ret < 0)
+		return ret;
+
+	ret = max3010xRegisterWrite(dev, MAX3010X_REG_MODE_CONFIG, mode_register_value);
+	if (ret < 0)
+		return ret;
+
+	uint8_t mode_readback = 0;
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_MODE_CONFIG, &mode_readback);
+	if (ret < 0)
+		return ret;
+
+	if ((mode_readback & (MAX3010X_MODE_SHDN | MAX3010X_MODE_MASK)) != mode_register_value)
+		return -EIO;
 
 #if IS_ENABLED(CONFIG_LOG) && (CONFIG_MAX3010X_LOG_LEVEL >= LOG_LEVEL_DBG)
 	max3010xDumpRegisters(dev);
@@ -238,8 +217,7 @@ int max3010xDisable(const struct device* const dev)
 	 * All configuration registers retain their values (~0.7 uA standby).
 	 * For true power-off, the app can cut the sensor_pwr regulator.
 	 */
-	return max3010xRegisterWrite(dev, MAX3010X_REG_MODE_CONFIG,
-								 MAX3010X_MODE_SHDN | (data->current_mode & MAX3010X_MODE_MASK));
+	return max3010xRegisterWrite(dev, MAX3010X_REG_MODE_CONFIG, MAX3010X_MODE_SHDN | (data->current_mode & MAX3010X_MODE_MASK));
 }
 
 int max3010xSetMode(const struct device* const dev, const MAX3010xMode mode)
@@ -247,18 +225,25 @@ int max3010xSetMode(const struct device* const dev, const MAX3010xMode mode)
 	if (dev == NULL)
 		return -EINVAL;
 
+	if (!max3010xModeIsValid(mode))
+		return -EINVAL;
+
 	MAX3010xDriverData* const data = dev->data;
-	data->current_mode = (uint8_t)(mode & MAX3010X_MODE_MASK);
 
 	/* Preserve current SHDN state while updating mode bits.
 	 * Changing mode while active resets FIFO pointers (per datasheet). */
 	uint8_t current_mode_register = 0;
-	const int ret = max3010xRegisterRead(dev, MAX3010X_REG_MODE_CONFIG, &current_mode_register);
+	int ret = max3010xRegisterRead(dev, MAX3010X_REG_MODE_CONFIG, &current_mode_register);
 	if (ret < 0)
 		return ret;
 
-	const uint8_t new_mode_value = (current_mode_register & MAX3010X_MODE_SHDN) | data->current_mode;
-	return max3010xRegisterWrite(dev, MAX3010X_REG_MODE_CONFIG, new_mode_value);
+	const uint8_t new_mode_value = (current_mode_register & MAX3010X_MODE_SHDN) | (uint8_t)mode;
+	ret = max3010xRegisterWriteVerify(dev, MAX3010X_REG_MODE_CONFIG, new_mode_value, MAX3010X_MODE_SHDN | MAX3010X_MODE_MASK);
+	if (ret < 0)
+		return ret;
+
+	data->current_mode = (uint8_t)mode;
+	return 0;
 }
 
 int max3010xSetFIFOConfig(const struct device* const dev, const MAX3010xFIFOConfig* const config)
@@ -266,10 +251,16 @@ int max3010xSetFIFOConfig(const struct device* const dev, const MAX3010xFIFOConf
 	if (dev == NULL || config == NULL)
 		return -EINVAL;
 
-	const uint8_t fifo_config =
-		(uint8_t)(config->sample_average_mode << MAX3010X_FIFO_SAMPLE_AVERAGE_SHIFT) |
-		(config->is_rollover_enabled ? MAX3010X_FIFO_ROLLOVER_EN : 0) |
-		(config->almost_full_threshold & MAX3010X_FIFO_A_FULL_MASK);
+	if (!max3010xFIFOAverageIsValid(config->sample_average_mode))
+		return -EINVAL;
+
+	if (config->almost_full_threshold > MAX3010X_FIFO_A_FULL_MASK)
+		return -EINVAL;
+
+	uint8_t fifo_config = (uint8_t)config->sample_average_mode << MAX3010X_FIFO_SAMPLE_AVERAGE_SHIFT;
+	if (config->is_rollover_enabled)
+		fifo_config |= MAX3010X_FIFO_ROLLOVER_EN;
+	fifo_config |= config->almost_full_threshold;
 
 	return max3010xRegisterWriteVerify(dev, MAX3010X_REG_FIFO_CONFIG, fifo_config, 0xFF);
 }
@@ -279,10 +270,16 @@ int max3010xSetSPO2Config(const struct device* const dev, const MAX3010xSPO2Conf
 	if (dev == NULL || config == NULL)
 		return -EINVAL;
 
-	const uint8_t spo2_config =
-		(uint8_t)(config->adc_range << MAX3010X_SPO2_ADC_RANGE_SHIFT) |
-		(uint8_t)(config->sample_rate << MAX3010X_SPO2_SAMPLE_RATE_SHIFT) |
-		(uint8_t)(config->pulse_width << MAX3010X_SPO2_PULSE_WIDTH_SHIFT);
+	if (!max3010xADCRangeIsValid(config->adc_range))
+		return -EINVAL;
+
+	if (!max3010xSampleRateIsValid(config->sample_rate))
+		return -EINVAL;
+
+	if (!max3010xPulseWidthIsValid(config->pulse_width))
+		return -EINVAL;
+
+	const uint8_t spo2_config = ((uint8_t)config->adc_range << MAX3010X_SPO2_ADC_RANGE_SHIFT) | ((uint8_t)config->sample_rate << MAX3010X_SPO2_SAMPLE_RATE_SHIFT) | ((uint8_t)config->pulse_width << MAX3010X_SPO2_PULSE_WIDTH_SHIFT);
 
 	return max3010xRegisterWriteVerify(dev, MAX3010X_REG_SPO2_CONFIG, spo2_config, 0xFF);
 }
@@ -290,6 +287,9 @@ int max3010xSetSPO2Config(const struct device* const dev, const MAX3010xSPO2Conf
 int max3010xSetADCRange(const struct device* const dev, const MAX3010xADCRange range)
 {
 	if (dev == NULL)
+		return -EINVAL;
+
+	if (!max3010xADCRangeIsValid(range))
 		return -EINVAL;
 
 	uint8_t spo2_config = 0;
@@ -307,6 +307,9 @@ int max3010xSetSampleRate(const struct device* const dev, const MAX3010xSampleRa
 	if (dev == NULL)
 		return -EINVAL;
 
+	if (!max3010xSampleRateIsValid(rate))
+		return -EINVAL;
+
 	uint8_t spo2_config = 0;
 	const int ret = max3010xRegisterRead(dev, MAX3010X_REG_SPO2_CONFIG, &spo2_config);
 	if (ret < 0)
@@ -320,6 +323,9 @@ int max3010xSetSampleRate(const struct device* const dev, const MAX3010xSampleRa
 int max3010xSetPulseWidth(const struct device* const dev, const MAX3010xPulseWidth width)
 {
 	if (dev == NULL)
+		return -EINVAL;
+
+	if (!max3010xPulseWidthIsValid(width))
 		return -EINVAL;
 
 	uint8_t spo2_config = 0;
@@ -339,7 +345,12 @@ int max3010xSetLEDAmplitude(const struct device* const dev, const MAX3010xLEDAmp
 
 	const MAX3010xDriverConfig* const cfg = dev->config;
 	const bool is_max30101 = (cfg->variant == MAX3010X_VARIANT_MAX30101);
-	MAX3010xDriverData* const data = dev->data;
+
+	if (!is_max30101)
+	{
+		if (config->green != 0 || config->green2 != 0)
+			return -ENOTSUP;
+	}
 
 	int ret = max3010xRegisterWriteVerify(dev, MAX3010X_REG_LED1_PA, config->red, 0xFF);
 	if (ret < 0)
@@ -349,12 +360,14 @@ int max3010xSetLEDAmplitude(const struct device* const dev, const MAX3010xLEDAmp
 	if (ret < 0)
 		return ret;
 
-	/* LED3_PA (0x0E) is MAX30101-only (Green LED).
-	 * LED4_PA (0x0F) is reserved on both MAX30101 and MAX30102 (MAX30105 only).
-	 * PILOT_PA (0x10) is valid on both variants (proximity pilot pulse). */
+	/* MAX30101's green LED sinks the combined LED3_PA and LED4_PA currents. */
 	if (is_max30101)
 	{
 		ret = max3010xRegisterWriteVerify(dev, MAX3010X_REG_LED3_PA, config->green, 0xFF);
+		if (ret < 0)
+			return ret;
+
+		ret = max3010xRegisterWriteVerify(dev, MAX3010X_REG_LED4_PA, config->green2, 0xFF);
 		if (ret < 0)
 			return ret;
 	}
@@ -362,13 +375,6 @@ int max3010xSetLEDAmplitude(const struct device* const dev, const MAX3010xLEDAmp
 	ret = max3010xRegisterWriteVerify(dev, MAX3010X_REG_PILOT_PA, config->pilot, 0xFF);
 	if (ret < 0)
 		return ret;
-
-	// Update saved LED cache for enable/disable cycling
-	data->saved_led[0] = config->red;
-	data->saved_led[1] = config->ir;
-	data->saved_led[2] = config->green;
-	data->saved_led[3] = config->green2;
-	data->saved_led[4] = config->pilot;
 
 	return 0;
 }
@@ -379,28 +385,17 @@ int max3010xSetLEDChannelAmplitude(const struct device* const dev, const MAX3010
 		return -EINVAL;
 
 	const MAX3010xDriverConfig* const cfg = dev->config;
-	MAX3010xDriverData* const data = dev->data;
-	int ret;
 
 	switch (channel)
 	{
 		case MAX3010X_LED_RED:
-			ret = max3010xRegisterWrite(dev, MAX3010X_REG_LED1_PA, value);
-			if (ret == 0)
-				data->saved_led[0] = value;
-			return ret;
+			return max3010xRegisterWrite(dev, MAX3010X_REG_LED1_PA, value);
 		case MAX3010X_LED_IR:
-			ret = max3010xRegisterWrite(dev, MAX3010X_REG_LED2_PA, value);
-			if (ret == 0)
-				data->saved_led[1] = value;
-			return ret;
+			return max3010xRegisterWrite(dev, MAX3010X_REG_LED2_PA, value);
 		case MAX3010X_LED_GREEN:
 			if (cfg->variant == MAX3010X_VARIANT_MAX30102)
 				return -ENOTSUP;
-			ret = max3010xRegisterWrite(dev, MAX3010X_REG_LED3_PA, value);
-			if (ret == 0)
-				data->saved_led[2] = value;
-			return ret;
+			return max3010xRegisterWrite(dev, MAX3010X_REG_LED3_PA, value);
 		default:
 			return -EINVAL;
 	}
@@ -412,15 +407,14 @@ int max3010xSetSlots(const struct device* const dev, const MAX3010xSlotConfig* c
 		return -EINVAL;
 
 	const MAX3010xDriverConfig* const cfg = dev->config;
-	const MAX3010xSlot slot0_value = max3010xSanitizeSlot(cfg, config->slot[0]);
-	const MAX3010xSlot slot1_value = max3010xSanitizeSlot(cfg, config->slot[1]);
-	const MAX3010xSlot slot2_value = max3010xSanitizeSlot(cfg, config->slot[2]);
-	const MAX3010xSlot slot3_value = max3010xSanitizeSlot(cfg, config->slot[3]);
+	int ret = max3010xValidateSlots(cfg, config);
+	if (ret < 0)
+		return ret;
 
-	const uint8_t ctrl1 = (uint8_t)(slot1_value << 4) | (uint8_t)slot0_value;
-	const uint8_t ctrl2 = (uint8_t)(slot3_value << 4) | (uint8_t)slot2_value;
+	const uint8_t ctrl1 = ((uint8_t)config->slot[1] << MAX3010X_MULTI_LED_SLOT2_SHIFT) | ((uint8_t)config->slot[0] << MAX3010X_MULTI_LED_SLOT1_SHIFT);
+	const uint8_t ctrl2 = ((uint8_t)config->slot[3] << MAX3010X_MULTI_LED_SLOT4_SHIFT) | ((uint8_t)config->slot[2] << MAX3010X_MULTI_LED_SLOT3_SHIFT);
 
-	int ret = max3010xRegisterWriteVerify(dev, MAX3010X_REG_MULTI_LED_CTRL1, ctrl1, 0x77);
+	ret = max3010xRegisterWriteVerify(dev, MAX3010X_REG_MULTI_LED_CTRL1, ctrl1, 0x77);
 	if (ret < 0)
 		return ret;
 
@@ -429,7 +423,84 @@ int max3010xSetSlots(const struct device* const dev, const MAX3010xSlotConfig* c
 		return ret;
 
 	MAX3010xDriverData* const data = dev->data;
-	max3010xBuildChannelMap(cfg, config, &data->map);
+	max3010xBuildChannelMap(config, &data->map);
+	return 0;
+}
+
+int max3010xGetConfig(const struct device* const dev, MAX3010xConfig* const config)
+{
+	if (dev == NULL || config == NULL)
+		return -EINVAL;
+
+	uint8_t fifo;
+	int ret = max3010xRegisterRead(dev, MAX3010X_REG_FIFO_CONFIG, &fifo);
+	if (ret < 0)
+		return ret;
+
+	uint8_t mode;
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_MODE_CONFIG, &mode);
+	if (ret < 0)
+		return ret;
+
+	uint8_t spo2;
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_SPO2_CONFIG, &spo2);
+	if (ret < 0)
+		return ret;
+
+	uint8_t slots_1_2;
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_MULTI_LED_CTRL1, &slots_1_2);
+	if (ret < 0)
+		return ret;
+
+	uint8_t slots_3_4;
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_MULTI_LED_CTRL2, &slots_3_4);
+	if (ret < 0)
+		return ret;
+
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_LED1_PA, &config->led_amplitude.red);
+	if (ret < 0)
+		return ret;
+
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_LED2_PA, &config->led_amplitude.ir);
+	if (ret < 0)
+		return ret;
+
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_LED3_PA, &config->led_amplitude.green);
+	if (ret < 0)
+		return ret;
+
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_LED4_PA, &config->led_amplitude.green2);
+	if (ret < 0)
+		return ret;
+
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_PILOT_PA, &config->led_amplitude.pilot);
+	if (ret < 0)
+		return ret;
+
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_INT_ENABLE_1, &config->interrupt_enable_1_mask);
+	if (ret < 0)
+		return ret;
+
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_INT_ENABLE_2, &config->interrupt_enable_2_mask);
+	if (ret < 0)
+		return ret;
+
+	ret = max3010xRegisterRead(dev, MAX3010X_REG_PROX_INT_THRESH, &config->proximity_interrupt_threshold);
+	if (ret < 0)
+		return ret;
+
+	config->mode = (MAX3010xMode)(mode & MAX3010X_MODE_MASK);
+	config->is_shutdown = (mode & MAX3010X_MODE_SHDN) != 0U;
+	config->fifo.sample_average_mode = (MAX3010xFIFOAverage)((fifo & MAX3010X_FIFO_SAMPLE_AVERAGE_MASK) >> MAX3010X_FIFO_SAMPLE_AVERAGE_SHIFT);
+	config->fifo.almost_full_threshold = fifo & MAX3010X_FIFO_A_FULL_MASK;
+	config->fifo.is_rollover_enabled = (fifo & MAX3010X_FIFO_ROLLOVER_EN) != 0U;
+	config->spo2.adc_range = (MAX3010xADCRange)((spo2 & MAX3010X_SPO2_ADC_RANGE_MASK) >> MAX3010X_SPO2_ADC_RANGE_SHIFT);
+	config->spo2.sample_rate = (MAX3010xSampleRate)((spo2 & MAX3010X_SPO2_SAMPLE_RATE_MASK) >> MAX3010X_SPO2_SAMPLE_RATE_SHIFT);
+	config->spo2.pulse_width = (MAX3010xPulseWidth)((spo2 & MAX3010X_SPO2_PULSE_WIDTH_MASK) >> MAX3010X_SPO2_PULSE_WIDTH_SHIFT);
+	config->slots.slot[0] = (MAX3010xSlot)((slots_1_2 >> MAX3010X_MULTI_LED_SLOT1_SHIFT) & MAX3010X_MULTI_LED_SLOT_MASK);
+	config->slots.slot[1] = (MAX3010xSlot)((slots_1_2 >> MAX3010X_MULTI_LED_SLOT2_SHIFT) & MAX3010X_MULTI_LED_SLOT_MASK);
+	config->slots.slot[2] = (MAX3010xSlot)((slots_3_4 >> MAX3010X_MULTI_LED_SLOT3_SHIFT) & MAX3010X_MULTI_LED_SLOT_MASK);
+	config->slots.slot[3] = (MAX3010xSlot)((slots_3_4 >> MAX3010X_MULTI_LED_SLOT4_SHIFT) & MAX3010X_MULTI_LED_SLOT_MASK);
 	return 0;
 }
 
@@ -440,13 +511,6 @@ int max3010xApplyDefaultConfig(const struct device* const dev)
 
 	const MAX3010xDriverConfig* const cfg = dev->config;
 	MAX3010xDriverData* const data = dev->data;
-
-	/*
-	 * Reset device to get clean POR state, then reconfigure.
-	 * All config registers are writable in MODE=0 (POR default).
-	 * max3010xEnable() activates sampling when the app starts.
-	 */
-	data->current_mode = (uint8_t)(cfg->mode & MAX3010X_MODE_MASK);
 
 	int ret = max3010xReset(dev);
 	if (ret < 0)
@@ -472,13 +536,12 @@ int max3010xApplyDefaultConfig(const struct device* const dev)
 	if (ret < 0)
 		return ret;
 
-	// Cache LED amplitudes for enable/disable cycling
-	data->saved_led[0] = cfg->led_amplitude.red;
-	data->saved_led[1] = cfg->led_amplitude.ir;
-	data->saved_led[2] = cfg->led_amplitude.green;
-	data->saved_led[3] = cfg->led_amplitude.green2;
-	data->saved_led[4] = cfg->led_amplitude.pilot;
+	const uint8_t mode = (uint8_t)cfg->mode;
+	ret = max3010xRegisterWriteVerify(dev, MAX3010X_REG_MODE_CONFIG, MAX3010X_MODE_SHDN | mode, MAX3010X_MODE_SHDN | MAX3010X_MODE_MASK);
+	if (ret < 0)
+		return ret;
 
+	data->current_mode = mode;
 	return 0;
 }
 
@@ -589,8 +652,7 @@ int max3010xGetTemperature(const struct device* const dev, float* const temperat
 			}
 			return ret;
 		}
-	} while (((temperature_config & MAX3010X_TEMP_EN) || elapsed_ms < 30) &&
-			 elapsed_ms < MAX3010X_TEMP_CONV_WAIT_MS);
+	} while (((temperature_config & MAX3010X_TEMP_EN) || elapsed_ms < 30) && elapsed_ms < MAX3010X_TEMP_CONV_WAIT_MS);
 
 	if (elapsed_ms >= MAX3010X_TEMP_CONV_WAIT_MS)
 	{
@@ -639,8 +701,7 @@ int max3010xGetTemperature(const struct device* const dev, float* const temperat
 	}
 
 	// TEMP_INT is signed 8-bit, TEMP_FRAC is 4-bit (0.0625 deg C per LSB)
-	*temperature_deg_c = (float)(int8_t)temp_int +
-						 ((float)(temp_frac & MAX3010X_TEMP_FRAC_MASK) * 0.0625f);
+	*temperature_deg_c = (float)(int8_t)temp_int + ((float)(temp_frac & MAX3010X_TEMP_FRAC_MASK) * 0.0625f);
 	return 0;
 }
 
@@ -649,11 +710,16 @@ int max3010xGetInterruptStatus(const struct device* const dev, uint8_t* const in
 	if (dev == NULL)
 		return -EINVAL;
 
+	MAX3010xDriverData* const data = dev->data;
+
 	if (int1 != NULL)
 	{
 		const int ret = max3010xRegisterRead(dev, MAX3010X_REG_INT_STATUS_1, int1);
 		if (ret < 0)
 			return ret;
+
+		if ((*int1 & (MAX3010X_INT_A_FULL | MAX3010X_INT_PPG_RDY)) != 0)
+			data->fifo_activity = true;
 	}
 
 	if (int2 != NULL)
@@ -671,7 +737,18 @@ int max3010xReadFIFO(const struct device* const dev, uint8_t* const buffer, cons
 	if (dev == NULL || buffer == NULL || size_bytes == 0)
 		return -EINVAL;
 
-	return max3010xRegisterReadBurst(dev, MAX3010X_REG_FIFO_DATA, buffer, size_bytes);
+	MAX3010xDriverData* const data = dev->data;
+	const size_t bytes_per_sample = (size_t)data->map.active_channel_count * MAX3010X_BYTES_PER_CHANNEL;
+	if (bytes_per_sample == 0 || (size_bytes % bytes_per_sample) != 0)
+		return -EINVAL;
+
+	const int ret = max3010xRegisterReadBurst(dev, MAX3010X_REG_FIFO_DATA, buffer, size_bytes);
+	if (ret < 0)
+		return ret;
+
+	const size_t samples_read = size_bytes / bytes_per_sample;
+	max3010xRecordFIFORead(data, samples_read);
+	return 0;
 }
 
 int max3010xFlushFIFO(const struct device* const dev)
@@ -691,6 +768,10 @@ int max3010xFlushFIFO(const struct device* const dev)
 	if (ret < 0)
 		return ret;
 
+	MAX3010xDriverData* const data = dev->data;
+	data->available_samples = 0;
+	data->fifo_activity = false;
+
 	LOG_DBG("FIFO flushed");
 	return 0;
 }
@@ -699,6 +780,16 @@ int max3010xGetRawChannel(const struct device* const dev, const MAX3010xLEDChann
 {
 	if (dev == NULL || value == NULL)
 		return -EINVAL;
+
+	switch (channel)
+	{
+		case MAX3010X_LED_RED:
+		case MAX3010X_LED_IR:
+		case MAX3010X_LED_GREEN:
+			break;
+		default:
+			return -EINVAL;
+	}
 
 	const MAX3010xDriverData* const data = dev->data;
 	const uint8_t fifo_index = data->map.fifo_index[channel];
@@ -724,10 +815,19 @@ int max3010xSetInterruptCallback(const struct device* const dev, const MAX3010xC
 	if (dev == NULL)
 		return -EINVAL;
 
-	// Just store the pointer; interrupt enable/disable is handled by max3010xEnableInterrupt()
+	const MAX3010xDriverConfig* const cfg = dev->config;
+	if (max3010xHasGPIO(&cfg->int_gpio))
+	{
+		const int ret = gpio_pin_interrupt_configure_dt(&cfg->int_gpio, GPIO_INT_DISABLE);
+		if (ret < 0)
+			return ret;
+	}
+
 	MAX3010xDriverData* const data = dev->data;
-	data->int_callback = callback;
+	const unsigned int key = irq_lock();
 	data->int_user_data = user_data;
+	data->int_callback = callback;
+	irq_unlock(key);
 
 	return 0;
 }
@@ -748,43 +848,14 @@ int max3010xEnableInterrupt(const struct device* const dev, const bool is_enable
 	if (is_enabled)
 	{
 		LOG_DBG("Enabling INT GPIO interrupt");
-		return gpio_pin_interrupt_configure_dt(&cfg->int_gpio,
-											   GPIO_INT_EDGE_TO_ACTIVE);
+		return gpio_pin_interrupt_configure_dt(&cfg->int_gpio, GPIO_INT_EDGE_TO_ACTIVE);
 	}
 	else
 	{
 		LOG_DBG("Disabling INT GPIO interrupt");
-		return gpio_pin_interrupt_configure_dt(&cfg->int_gpio,
-											   GPIO_INT_DISABLE);
+		return gpio_pin_interrupt_configure_dt(&cfg->int_gpio, GPIO_INT_DISABLE);
 	}
 #endif
-}
-
-uint32_t max3010xGetSampleCount(const struct device* const dev)
-{
-	if (dev == NULL)
-		return 0;
-
-	const MAX3010xDriverData* const data = dev->data;
-	return (uint32_t)atomic_get((const atomic_t*)&data->sample_count);
-}
-
-void max3010xResetSampleCount(const struct device* const dev)
-{
-	if (dev == NULL)
-		return;
-
-	MAX3010xDriverData* const data = dev->data;
-	atomic_set(&data->sample_count, 0);
-}
-
-uint32_t max3010xGetAndResetSampleCount(const struct device* const dev)
-{
-	if (dev == NULL)
-		return 0;
-
-	MAX3010xDriverData* const data = dev->data;
-	return (uint32_t)atomic_clear(&data->sample_count);
 }
 
 int max3010xDumpRegisters(const struct device* const dev)
@@ -795,16 +866,13 @@ int max3010xDumpRegisters(const struct device* const dev)
 	uint8_t register_value = 0;
 
 	max3010xRegisterRead(dev, MAX3010X_REG_MODE_CONFIG, &register_value);
-	LOG_DBG("REG MODE_CONFIG=0x%02x (SHDN=%u RST=%u MODE=%u)",
-			register_value, (register_value >> 7) & 1, (register_value >> 6) & 1, register_value & 0x07);
+	LOG_DBG("REG MODE_CONFIG=0x%02x (SHDN=%u RST=%u MODE=%u)", register_value, (register_value >> 7) & 1, (register_value >> 6) & 1, register_value & 0x07);
 
 	max3010xRegisterRead(dev, MAX3010X_REG_FIFO_CONFIG, &register_value);
-	LOG_DBG("REG FIFO_CONFIG=0x%02x (AVG=%u RO=%u AF=%u)",
-			register_value, (register_value >> 5) & 7, (register_value >> 4) & 1, register_value & 0x0F);
+	LOG_DBG("REG FIFO_CONFIG=0x%02x (AVG=%u RO=%u AF=%u)", register_value, (register_value >> 5) & 7, (register_value >> 4) & 1, register_value & 0x0F);
 
 	max3010xRegisterRead(dev, MAX3010X_REG_SPO2_CONFIG, &register_value);
-	LOG_DBG("REG SPO2_CONFIG=0x%02x (ADC=%u SR=%u PW=%u)",
-			register_value, (register_value >> 5) & 3, (register_value >> 2) & 7, register_value & 3);
+	LOG_DBG("REG SPO2_CONFIG=0x%02x (ADC=%u SR=%u PW=%u)", register_value, (register_value >> 5) & 3, (register_value >> 2) & 7, register_value & 3);
 
 	max3010xRegisterRead(dev, MAX3010X_REG_LED1_PA, &register_value);
 	LOG_DBG("REG LED1_PA=0x%02x", register_value);
@@ -816,12 +884,10 @@ int max3010xDumpRegisters(const struct device* const dev)
 	LOG_DBG("REG LED3_PA=0x%02x", register_value);
 
 	max3010xRegisterRead(dev, MAX3010X_REG_MULTI_LED_CTRL1, &register_value);
-	LOG_DBG("REG CTRL1=0x%02x (slot2=%u slot1=%u)",
-			register_value, (register_value >> 4) & 7, register_value & 7);
+	LOG_DBG("REG CTRL1=0x%02x (slot2=%u slot1=%u)", register_value, (register_value >> 4) & 7, register_value & 7);
 
 	max3010xRegisterRead(dev, MAX3010X_REG_MULTI_LED_CTRL2, &register_value);
-	LOG_DBG("REG CTRL2=0x%02x (slot4=%u slot3=%u)",
-			register_value, (register_value >> 4) & 7, register_value & 7);
+	LOG_DBG("REG CTRL2=0x%02x (slot4=%u slot3=%u)", register_value, (register_value >> 4) & 7, register_value & 7);
 
 	max3010xRegisterRead(dev, MAX3010X_REG_INT_ENABLE_1, &register_value);
 	LOG_DBG("REG INT_EN1=0x%02x", register_value);
@@ -832,8 +898,7 @@ int max3010xDumpRegisters(const struct device* const dev)
 	max3010xRegisterRead(dev, MAX3010X_REG_FIFO_WR_PTR, &fifo_write_pointer);
 	max3010xRegisterRead(dev, MAX3010X_REG_FIFO_RD_PTR, &fifo_read_pointer);
 	max3010xRegisterRead(dev, MAX3010X_REG_OVF_COUNTER, &overflow_count);
-	LOG_DBG("REG FIFO WR=%u RD=%u OVF=%u",
-			fifo_write_pointer & 0x1F, fifo_read_pointer & 0x1F, overflow_count & 0x1F);
+	LOG_DBG("REG FIFO WR=%u RD=%u OVF=%u", fifo_write_pointer & 0x1F, fifo_read_pointer & 0x1F, overflow_count & 0x1F);
 
 	return 0;
 }
@@ -870,6 +935,7 @@ int max3010xGetAvailableSamples(const struct device* const dev, uint8_t* const c
 	if (dev == NULL || count == NULL)
 		return -EINVAL;
 
+	MAX3010xDriverData* const data = dev->data;
 	uint8_t write_pointer_raw = 0;
 	int ret = max3010xRegisterRead(dev, MAX3010X_REG_FIFO_WR_PTR, &write_pointer_raw);
 	if (ret < 0)
@@ -883,10 +949,28 @@ int max3010xGetAvailableSamples(const struct device* const dev, uint8_t* const c
 	const uint8_t write_pointer_masked = write_pointer_raw & MAX3010X_FIFO_PTR_MASK;
 	const uint8_t read_pointer_masked = read_pointer_raw & MAX3010X_FIFO_PTR_MASK;
 
-	if (write_pointer_masked >= read_pointer_masked)
+	if (write_pointer_masked > read_pointer_masked)
 		*count = write_pointer_masked - read_pointer_masked;
-	else
+	else if (write_pointer_masked < read_pointer_masked)
 		*count = (uint8_t)(MAX3010X_FIFO_DEPTH + write_pointer_masked - read_pointer_masked);
+	else
+	{
+		uint8_t overflow_count = 0;
+		ret = max3010xRegisterRead(dev, MAX3010X_REG_OVF_COUNTER, &overflow_count);
+		if (ret < 0)
+			return ret;
+
+		/* Equal pointers mean either empty or exactly 32 unread samples. */
+		const bool overflowed = (overflow_count & MAX3010X_OVF_COUNTER_MASK) != 0;
+		if (overflowed || data->fifo_activity)
+			*count = MAX3010X_FIFO_DEPTH;
+		else
+			*count = 0;
+	}
+
+	data->available_samples = *count;
+	if (*count != 0)
+		data->fifo_activity = true;
 
 	return 0;
 }
@@ -994,8 +1078,7 @@ static int max3010xRegisterWriteVerify(const struct device* const dev, const uin
 			}
 		}
 
-		LOG_ERR("Reg 0x%02x verify FAIL after retries: wrote 0x%02x, read 0x%02x (mask 0x%02x)",
-				register_address, value, readback, mask);
+		LOG_ERR("Reg 0x%02x verify FAIL after retries: wrote 0x%02x, read 0x%02x (mask 0x%02x)", register_address, value, readback, mask);
 		return -EIO;
 	}
 
@@ -1009,6 +1092,115 @@ static int max3010xRegisterReadBurst(const struct device* const dev, const uint8
 	return i2c_burst_read_dt(&cfg->i2c, register_address, buffer, length);
 }
 
+static bool max3010xModeIsValid(const MAX3010xMode mode)
+{
+	switch (mode)
+	{
+		case MAX3010X_MODE_HEART_RATE:
+		case MAX3010X_MODE_SPO2:
+		case MAX3010X_MODE_MULTI_LED:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool max3010xFIFOAverageIsValid(const MAX3010xFIFOAverage average)
+{
+	switch (average)
+	{
+		case MAX3010X_FIFO_AVG_1:
+		case MAX3010X_FIFO_AVG_2:
+		case MAX3010X_FIFO_AVG_4:
+		case MAX3010X_FIFO_AVG_8:
+		case MAX3010X_FIFO_AVG_16:
+		case MAX3010X_FIFO_AVG_32:
+		case MAX3010X_FIFO_AVG_32B:
+		case MAX3010X_FIFO_AVG_32C:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool max3010xADCRangeIsValid(const MAX3010xADCRange range)
+{
+	switch (range)
+	{
+		case MAX3010X_ADC_RANGE_7P81:
+		case MAX3010X_ADC_RANGE_15P63:
+		case MAX3010X_ADC_RANGE_31P25:
+		case MAX3010X_ADC_RANGE_62P50:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool max3010xSampleRateIsValid(const MAX3010xSampleRate rate)
+{
+	switch (rate)
+	{
+		case MAX3010X_SR_50HZ:
+		case MAX3010X_SR_100HZ:
+		case MAX3010X_SR_200HZ:
+		case MAX3010X_SR_400HZ:
+		case MAX3010X_SR_800HZ:
+		case MAX3010X_SR_1000HZ:
+		case MAX3010X_SR_1600HZ:
+		case MAX3010X_SR_3200HZ:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool max3010xPulseWidthIsValid(const MAX3010xPulseWidth width)
+{
+	switch (width)
+	{
+		case MAX3010X_PW_69US:
+		case MAX3010X_PW_118US:
+		case MAX3010X_PW_215US:
+		case MAX3010X_PW_411US:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static int max3010xValidateSlots(const MAX3010xDriverConfig* const cfg, const MAX3010xSlotConfig* const slots)
+{
+	bool disabled_slot_found = false;
+
+	for (size_t slot_index = 0; slot_index < MAX3010X_MAX_NUM_SLOTS; slot_index++)
+	{
+		const MAX3010xSlot slot = slots->slot[slot_index];
+
+		switch (slot)
+		{
+			case MAX3010X_SLOT_DISABLED:
+				disabled_slot_found = true;
+				break;
+			case MAX3010X_SLOT_RED_LED1_PA:
+			case MAX3010X_SLOT_IR_LED2_PA:
+				if (disabled_slot_found)
+					return -EINVAL;
+				break;
+			case MAX3010X_SLOT_GREEN_LED3_PA:
+				if (cfg->variant == MAX3010X_VARIANT_MAX30102)
+					return -ENOTSUP;
+				if (disabled_slot_found)
+					return -EINVAL;
+				break;
+			default:
+				return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
 static bool max3010xHasGPIO(const struct gpio_dt_spec* const spec)
 {
 	return spec->port != NULL;
@@ -1019,62 +1211,44 @@ static void max3010xIntGPIOHandler(const struct device* const port, struct gpio_
 	ARG_UNUSED(port);
 	ARG_UNUSED(pins);
 
-	MAX3010xDriverData* const data =
-		CONTAINER_OF(gpio_callback, MAX3010xDriverData, gpio_cb);
+	MAX3010xDriverData* const data = CONTAINER_OF(gpio_callback, MAX3010xDriverData, gpio_cb);
 
-	atomic_inc(&data->sample_count);
-
-	// Snapshot callback + user_data locally to avoid TOCTOU
 	const MAX3010xCallback callback = data->int_callback;
 	void* const user_data = data->int_user_data;
 	if (callback != NULL)
 		callback(user_data);
 }
 
-static void max3010xBuildChannelMap(const MAX3010xDriverConfig* const cfg, const MAX3010xSlotConfig* const slots, MAX3010xChannelMap* const map)
+static void max3010xBuildChannelMap(const MAX3010xSlotConfig* const slots, MAX3010xChannelMap* const map)
 {
 	map->active_channel_count = 0;
 	for (uint32_t channel_index = 0; channel_index < MAX3010X_MAX_NUM_CHANNELS; channel_index++)
 		map->fifo_index[channel_index] = MAX3010X_MAX_NUM_SLOTS;
 
-	// Iterate all 4 slots - each active slot produces 3 bytes in the FIFO
-	for (uint32_t slot_idx = 0; slot_idx < MAX3010X_MAX_NUM_SLOTS; slot_idx++)
+	for (uint32_t slot_index = 0; slot_index < MAX3010X_MAX_NUM_SLOTS; slot_index++)
 	{
-		const uint8_t slot_value = (uint8_t)slots->slot[slot_idx] &
-								   MAX3010X_MULTI_LED_SLOT_MASK;
-		if (slot_value == 0)
-			continue;
+		const MAX3010xSlot slot = slots->slot[slot_index];
+		if (slot == MAX3010X_SLOT_DISABLED)
+			break;
 
-		/* Slot values 1-3 map to LED channels 0-2 (Red, IR, Green).
-		 * Slot values 5-7 are pilot mode - also map to channels 0-2. */
-		const uint8_t led_channel = (slot_value <= 3)
-										? (slot_value - 1)
-										: (slot_value - 5);
+		const uint8_t led_channel = (uint8_t)slot - 1U;
+		if (map->fifo_index[led_channel] >= MAX3010X_MAX_NUM_SLOTS)
+			map->fifo_index[led_channel] = map->active_channel_count;
 
-		if (cfg->variant == MAX3010X_VARIANT_MAX30102 &&
-			led_channel == MAX3010X_LED_GREEN)
-			continue;
-
-		if (led_channel < MAX3010X_MAX_NUM_CHANNELS)
-		{
-			// First occurrence wins if a channel appears in multiple slots
-			if (map->fifo_index[led_channel] >= MAX3010X_MAX_NUM_SLOTS)
-				map->fifo_index[led_channel] = (uint8_t)map->active_channel_count;
-		}
 		map->active_channel_count++;
 	}
 }
 
-static MAX3010xSlot max3010xSanitizeSlot(const MAX3010xDriverConfig* const cfg, const MAX3010xSlot slot)
+static void max3010xRecordFIFORead(MAX3010xDriverData* const data, const size_t samples_read)
 {
-	if (cfg->variant != MAX3010X_VARIANT_MAX30102)
-		return slot;
+	if (samples_read >= data->available_samples)
+	{
+		data->available_samples = 0;
+		data->fifo_activity = false;
+		return;
+	}
 
-	if (slot == MAX3010X_SLOT_GREEN_LED3_PA ||
-		slot == MAX3010X_SLOT_GREEN_PILOT_PA)
-		return MAX3010X_SLOT_DISABLED;
-
-	return slot;
+	data->available_samples -= (uint8_t)samples_read;
 }
 
 static int max3010xSensorSampleFetch(const struct device* const dev, const enum sensor_channel chan)
@@ -1099,12 +1273,11 @@ static int max3010xSensorSampleFetch(const struct device* const dev, const enum 
 	for (uint32_t channel_index = 0; channel_index < channel_count; channel_index++)
 	{
 		const uint32_t base = channel_index * MAX3010X_BYTES_PER_CHANNEL;
-		const uint32_t sample = ((uint32_t)read_buffer[base] << 16) |
-								((uint32_t)read_buffer[base + 1] << 8) |
-								(uint32_t)read_buffer[base + 2];
+		const uint32_t sample = ((uint32_t)read_buffer[base] << 16) | ((uint32_t)read_buffer[base + 1] << 8) | (uint32_t)read_buffer[base + 2];
 		data->data.raw[channel_index] = sample & MAX3010X_FIFO_DATA_MASK;
 	}
 
+	max3010xRecordFIFORead(data, 1);
 	return 0;
 }
 
@@ -1137,10 +1310,9 @@ static int max3010xSensorChannelGet(const struct device* const dev, const enum s
 	return 0;
 }
 
-static DEVICE_API(sensor, max3010x_api) =
-	{
-		.sample_fetch = max3010xSensorSampleFetch,
-		.channel_get = max3010xSensorChannelGet,
+static DEVICE_API(sensor, max3010x_api) = {
+	.sample_fetch = max3010xSensorSampleFetch,
+	.channel_get = max3010xSensorChannelGet,
 };
 
 static int max3010xDeviceInit(const struct device* const dev)
@@ -1151,14 +1323,18 @@ static int max3010xDeviceInit(const struct device* const dev)
 
 	LOG_INF("Initializing MAX3010x at 0x%02x", cfg->i2c.addr);
 
-	// Initialize runtime state
-	data->dev = dev;
 	data->int_callback = NULL;
 	data->int_user_data = NULL;
-	data->is_initialized = false;
-	data->current_mode = (uint8_t)(cfg->mode & MAX3010X_MODE_MASK);
+	data->current_mode = 0;
+	data->available_samples = 0;
+	data->fifo_activity = false;
 	k_mutex_init(&data->lock);
-	atomic_set(&data->sample_count, 0);
+
+	if (!max3010xModeIsValid(cfg->mode))
+	{
+		LOG_ERR("Invalid default mode: %u", (unsigned int)cfg->mode);
+		return -EINVAL;
+	}
 
 	for (uint32_t slot_index = 0; slot_index < MAX3010X_MAX_NUM_SLOTS; slot_index++)
 		data->data.raw[slot_index] = 0;
@@ -1186,8 +1362,7 @@ static int max3010xDeviceInit(const struct device* const dev)
 
 	if (part_id != MAX3010X_PART_ID)
 	{
-		LOG_ERR("Unexpected part ID: 0x%02X (expected 0x%02X)",
-				part_id, MAX3010X_PART_ID);
+		LOG_ERR("Unexpected part ID: 0x%02X (expected 0x%02X)", part_id, MAX3010X_PART_ID);
 		return -ENODEV;
 	}
 
@@ -1196,9 +1371,7 @@ static int max3010xDeviceInit(const struct device* const dev)
 	if (ret < 0)
 		LOG_WRN("Failed to read revision ID: %d", ret);
 
-	LOG_DBG("Part ID: 0x%02X, Rev: 0x%02X, Variant: %s",
-			part_id, rev_id,
-			cfg->variant == MAX3010X_VARIANT_MAX30101 ? "MAX30101" : "MAX30102");
+	LOG_DBG("Part ID: 0x%02X, Rev: 0x%02X, Variant: %s", part_id, rev_id, cfg->variant == MAX3010X_VARIANT_MAX30101 ? "MAX30101" : "MAX30102");
 
 	// Soft reset and wait
 	ret = max3010xReset(dev);
@@ -1251,13 +1424,6 @@ static int max3010xDeviceInit(const struct device* const dev)
 		return ret;
 	}
 
-	// Cache LED amplitudes for enable/disable cycling
-	data->saved_led[0] = cfg->led_amplitude.red;
-	data->saved_led[1] = cfg->led_amplitude.ir;
-	data->saved_led[2] = cfg->led_amplitude.green;
-	data->saved_led[3] = cfg->led_amplitude.green2;
-	data->saved_led[4] = cfg->led_amplitude.pilot;
-
 	// Apply Kconfig interrupt and proximity defaults
 	if (cfg->interrupt_enable_1_mask != 0 || cfg->interrupt_enable_2_mask != 0)
 	{
@@ -1294,14 +1460,15 @@ static int max3010xDeviceInit(const struct device* const dev)
 	 * Enable() clears SHDN to start sampling. All register values
 	 * persist through shutdown (per datasheet).
 	 */
-	ret = max3010xRegisterWrite(dev, MAX3010X_REG_MODE_CONFIG,
-								MAX3010X_MODE_SHDN | data->current_mode);
+	const uint8_t mode = (uint8_t)cfg->mode;
+	ret = max3010xRegisterWriteVerify(dev, MAX3010X_REG_MODE_CONFIG, MAX3010X_MODE_SHDN | mode, MAX3010X_MODE_SHDN | MAX3010X_MODE_MASK);
 	if (ret < 0)
 	{
 		LOG_ERR("Failed to enter shutdown: %d", ret);
 		return ret;
 	}
 
+	data->current_mode = mode;
 	LOG_DBG("Shutdown with MODE=0x%02x", data->current_mode);
 
 	// Configure GPIO interrupt (but leave disabled)
@@ -1321,16 +1488,14 @@ static int max3010xDeviceInit(const struct device* const dev)
 			return ret;
 		}
 
-		ret = gpio_pin_interrupt_configure_dt(&cfg->int_gpio,
-											  GPIO_INT_DISABLE);
+		ret = gpio_pin_interrupt_configure_dt(&cfg->int_gpio, GPIO_INT_DISABLE);
 		if (ret < 0)
 		{
 			LOG_ERR("INT GPIO int disable failed: %d", ret);
 			return ret;
 		}
 
-		gpio_init_callback(&data->gpio_cb, max3010xIntGPIOHandler,
-						   BIT(cfg->int_gpio.pin));
+		gpio_init_callback(&data->gpio_cb, max3010xIntGPIOHandler, BIT(cfg->int_gpio.pin));
 		ret = gpio_add_callback(cfg->int_gpio.port, &data->gpio_cb);
 		if (ret < 0)
 		{
@@ -1354,7 +1519,6 @@ static int max3010xDeviceInit(const struct device* const dev)
 	}
 #endif
 
-	data->is_initialized = true;
 	LOG_INF("MAX3010x ready (configured, idle)");
 	return 0;
 }
@@ -1368,13 +1532,12 @@ static int max3010xDeviceInit(const struct device* const dev)
 #define MAX3010X_DEFAULT_MODE MAX3010X_MODE_MULTI_LED
 #endif
 
-#define MAX3010X_VARIANT_FROM_DT(node_id) \
-	(DT_ENUM_IDX(node_id, variant) == 1   \
-		 ? MAX3010X_VARIANT_MAX30102      \
-		 : MAX3010X_VARIANT_MAX30101)
+#define MAX3010X_VARIANT_FROM_DT(node_id) (DT_ENUM_IDX(node_id, variant) == 1 ? MAX3010X_VARIANT_MAX30102 : MAX3010X_VARIANT_MAX30101)
 
-#define MAX3010X_DEFINE_NODE(node_id)                                         \
-	static MAX3010xDriverData max3010x_data_##node_id;                        \
+#define MAX3010X_MAX30101_VALUE(node_id, value) (DT_ENUM_IDX(node_id, variant) == 0 ? (value) : 0)
+
+#define MAX3010X_DEFINE_NODE(node_id)                                                                                                                                                                                                                                                                      \
+	static MAX3010xDriverData max3010x_data_##node_id;                                                                                                                                                                                                                                                     \
 	static const MAX3010xDriverConfig max3010x_config_##node_id =             \
 		{                                                                     \
 			.i2c = I2C_DT_SPEC_GET(node_id),                                  \
@@ -1403,23 +1566,19 @@ static int max3010xDeviceInit(const struct device* const dev)
 							CONFIG_MAX3010X_SLOT4,                            \
 						},                                                    \
 				},                                                            \
-			.led_amplitude =                                                  \
-				{                                                             \
-					.red = CONFIG_MAX3010X_LED1_PA,                           \
-					.ir = CONFIG_MAX3010X_LED2_PA,                            \
-					.green = CONFIG_MAX3010X_LED3_PA,                         \
-					.green2 = CONFIG_MAX3010X_LED4_PA,                        \
-					.pilot = CONFIG_MAX3010X_PILOT_PA,                        \
-				},                                                            \
+				.led_amplitude =                                                  \
+					{                                                             \
+						.red = CONFIG_MAX3010X_LED1_PA,                           \
+						.ir = CONFIG_MAX3010X_LED2_PA,                            \
+						.green = MAX3010X_MAX30101_VALUE(node_id, CONFIG_MAX3010X_LED3_PA), \
+						.green2 = MAX3010X_MAX30101_VALUE(node_id, CONFIG_MAX3010X_LED4_PA), \
+						.pilot = CONFIG_MAX3010X_PILOT_PA,                        \
+					},                                                            \
 			.interrupt_enable_1_mask = CONFIG_MAX3010X_INT_ENABLE_1,          \
 			.interrupt_enable_2_mask = CONFIG_MAX3010X_INT_ENABLE_2,          \
 			.proximity_interrupt_threshold = CONFIG_MAX3010X_PROX_INT_THRESH, \
 			.is_temp_enabled = IS_ENABLED(CONFIG_MAX3010X_TEMP_ENABLE),       \
-	};                                                                        \
-	DEVICE_DT_DEFINE(node_id, max3010xDeviceInit, NULL,                       \
-					 &max3010x_data_##node_id,                                \
-					 &max3010x_config_##node_id,                              \
-					 POST_KERNEL, CONFIG_MAX3010X_INIT_PRIORITY,              \
-					 &max3010x_api);
+	};                                                                                                                                                                                                                            \
+	DEVICE_DT_DEFINE(node_id, max3010xDeviceInit, NULL, &max3010x_data_##node_id, &max3010x_config_##node_id, POST_KERNEL, CONFIG_MAX3010X_INIT_PRIORITY, &max3010x_api);
 
 DT_FOREACH_STATUS_OKAY(maxim_max3010x, MAX3010X_DEFINE_NODE)
