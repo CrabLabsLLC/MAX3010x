@@ -23,7 +23,7 @@ config MAX3010X_INIT_PRIORITY
 
 config MAX3010X_LOG_LEVEL
 	int "MAX3010x log level"
-	default 3
+	default 2
 	range 0 4
 	help
 	  Sets log level for MAX3010x driver.
@@ -54,11 +54,11 @@ endchoice
 config MAX3010X_SAMPLE_RATE
 	int "Sample rate (0-7)"
 	range 0 7
-	default 0
+	default 1
 	help
 	  Sample rate selection:
-	    0 = 50 Hz (default, good for MVP)
-	    1 = 100 Hz
+	    0 = 50 Hz
+	    1 = 100 Hz (default)
 	    2 = 200 Hz
 	    3 = 400 Hz
 	    4 = 800 Hz
@@ -74,8 +74,8 @@ config MAX3010X_PULSE_WIDTH
 	  LED pulse width selection (affects ADC resolution):
 	    0 = 69us (15-bit ADC)
 	    1 = 118us (16-bit ADC)
-	    2 = 215us (17-bit ADC)
-	    3 = 411us (18-bit ADC, default, max resolution)
+	    2 = 215us (17-bit ADC, low-power application default)
+	    3 = 411us (18-bit ADC, maximum resolution)
 
 config MAX3010X_ADC_RANGE
 	int "ADC full-scale range (0-3)"
