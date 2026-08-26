@@ -11,7 +11,7 @@
  */
 
 /* Copyright (c) 2025 Crab Labs LLC */
-/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: MIT */
 
 #pragma once
 #ifndef MAX3010X_TYPES_H

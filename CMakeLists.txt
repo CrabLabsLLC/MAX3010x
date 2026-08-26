@@ -1,5 +1,5 @@
 # Copyright (c) 2025 Crab Labs LLC
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 
 if(CONFIG_MAX3010X)
   # Export public headers for applications that include the module.
